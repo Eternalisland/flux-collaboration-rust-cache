@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "attach",
+            "name": "附加到 Java 进程 (LLDB)",
+            "pid": "${command:pickProcess}",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "type": "cppdbg",
+            "request": "attach",
+            "name": "附加到 Java 进程 (GDB)",
+            "program": "${workspaceFolder}/target/debug/libflux_collaboration_rust_cache.dll",
+            "processId": "${command:pickProcess}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "为 gdb 启用整齐打印",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}

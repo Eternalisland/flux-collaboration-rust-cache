@@ -1,0 +1,49 @@
+[package]
+name = "flux-collaboration-rust-cache"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "flux_collaboration_rust_cache"
+crate-type = ["cdylib", "rlib"]  # 支持 JNI 动态库和普通库
+
+[dependencies]
+moka = { version = "0.12", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+uuid = { version = "1", features = ["v4"] }
+
+tokio = { version = "1", features = ["rt", "time", "sync", "rt-multi-thread"] }
+
+# 日志框架
+log = "0.4"
+env_logger = "0.10"
+
+# JNI 支持
+jni = "0.21"
+serde_json = "1"  # 用于 Java 和 Rust 之间的数据序列化
+
+# 高性能序列化方案
+rmp-serde = "1"  # MessagePack 序列化，比 JSON 快 2-3 倍
+base64 = "0.22"  # Base64 编码，用于二进制数据传输
+
+# FlatBuffers - 极致性能方案
+flatbuffers = "24.3"  # FlatBuffers 序列化，零拷贝，比 JSON 快 5-10 倍
+
+# 磁盘存储优化
+memmap2 = "0.9"  # 内存映射，零拷贝 I/O
+flate2 = "1.0"   # 压缩支持
+lz4 = "1.24"     # LZ4 快速压缩
+async-std = "1.12"  # 异步 I/O 支持
+
+# 高性能并发数据结构
+dashmap = "5.5"     # 无锁并发 HashMap
+crossbeam = "0.8"   # 无锁队列和并发工具
+crossbeam-queue = "0.3"
+rand = "0.8"
+libc = "0.2"
+
+arc-swap = "1.7.1"  # 无锁 Arc 切换
+lz4_flex = "0.11"
+scopeguard = "1"
+parking_lot = { version = "0.12", features = ["deadlock_detection"] } # 可选，便于排查死锁

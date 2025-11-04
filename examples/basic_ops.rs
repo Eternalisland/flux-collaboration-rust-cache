@@ -4,7 +4,7 @@ extern crate flux_collaboration_rust_cache as store;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::{thread, io};
 use flux_collaboration_rust_cache::{HighPerfMmapConfig, HighPerfMmapStorage};
 
@@ -155,6 +155,33 @@ fn basic_write_read_delete_and_persist() -> io::Result<()> {
         } else {
             let v = got.expect("existing key should be readable after reload");
             assert_eq!(v, *v_expected, "after reload, value mismatch for {}", k);
+        }
+    }
+
+
+    let bench_secs = 3600;
+    let t0 = Instant::now();
+    while t0.elapsed().as_secs() < bench_secs {
+
+        let n = 1024usize;
+        // let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            let k = format!("key-{i:024}");
+            let v = make_bytes(i as u32, 1024 * 1024 * 10 + (i % 2048));
+            store2.write(&k, &v)?;
+            // 立即读回
+            let got = store2.read(&k)?.expect("must read just written value");
+            assert_eq!(v, got, "value mismatch on immediate read for {k}");
+
+            store2.delete(&k).expect("TODO: panic message");
+
+            if( i == 1000usize) {
+                let stat = store2.get_stats();
+                // let mem_stat = store2.get_memory_stats();
+
+                println!("{:?}", stat);
+                // println!("{:?}", mem_stat);
+            }
         }
     }
 

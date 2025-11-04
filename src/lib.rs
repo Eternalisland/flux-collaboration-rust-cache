@@ -20,5 +20,13 @@ pub mod error_handling;
 pub use cache::{LocalCache, LocalCacheBuilder, MetricsSnapshot};
 pub use big_data_storage::{BigDataStorage, BigDataStorageConfig, BigDataStats};
 pub use optimized_cache::{OptimizedCache, OptimizedCacheConfig, CacheStats};
-pub use high_perf_mmap_storage::{HighPerfMmapStorage, HighPerfMmapConfig, HighPerfMmapStats};
-
+pub use high_perf_mmap_storage::{
+    CompressionAlgorithm,
+    CompressionConfig,
+    HighPerfMmapConfig,
+    HighPerfMmapStatus,
+    HighPerfMmapStats,
+    HighPerfMmapStorage,
+    MemoryLimitConfig,
+    MemoryStats,
+};

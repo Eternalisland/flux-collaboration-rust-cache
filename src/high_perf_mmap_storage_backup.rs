@@ -19,33 +19,13 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
+
+// ===== 新增：压缩相关依赖 =====
 // 推荐使用 lz4_flex：解压速度极快（4GB/s+），压缩比适中
 // 或者 zstd：可调节压缩级别，兼顾速度和压缩比
 // use lz4_flex;  // 需要添加到 Cargo.toml
 
-// ============================================================================
-//  高性能无锁 MMAP 磁盘存储
-// ---------------------------------------------------------------------------
-// 设计目标：
-//   1) 读路径零锁：读者只读 ArcSwap 中的 Arc<Mmap>，不持有任何互斥锁
-//   2) 写路径低争用：写入与扩容/重映射串行化，但尽量缩小临界区
-//   3) 统计全原子：所有指标通过原子变量更新，避免锁
-//   4) 预读与热缓存：DashMap + 预取线程，提升热点命中率
-//   5) 清理压缩：延迟删除 + 定期 GC + 尾部回缩/重写压缩
-//
-// 并发与内存模型要点：
-//   - 数据格式：每条记录 = [固定头(16B) | 数据]
-//       头结构：
-//         [0..4)  : 数据长度 u32 小端
-//         [4]     : 是否压缩（当前示例未使用）
-//         [5]     : commit 字节（0->1，表示写入完成）
-//         [6..8)  : 预留/对齐（未使用）
-//         [8..16) : 写入时间戳 u64 小端
-//   - 写入顺序：先写头与数据，再最后把 commit 位置写 1（提交）。
-//   - 读取顺序：自旋读 commit==1，随后以 Acquire 栅栏读取数据，确保可见性。
-//      注意：严格内存模型下，建议在写入 commit 前加一条 Release 栅栏，
-//
-// ============================================================================
 /// 压缩配置
 #[derive(Debug, Clone)]
 pub struct CompressionConfig {
@@ -87,9 +67,9 @@ pub enum CompressionAlgorithm {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             algorithm: CompressionAlgorithm::Lz4,
-            min_compress_size: 1024 * 1024,        // 小于512字节不压缩
+            min_compress_size: 512,        // 小于512字节不压缩
             min_compress_ratio: 0.90,      // 压缩不到10%就不保存
             async_compression: false,      // 默认同步压缩
             compression_level: 1,          // 最快压缩级别
@@ -114,6 +94,82 @@ impl CompressionContext {
     }
 }
 
+
+/// 内存统计信息
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    /// L1缓存占用的字节数
+    pub l1_cache_bytes: u64,
+    /// L1缓存的条目数
+    pub l1_cache_entries: usize,
+    /// 索引占用的字节数（近似值）
+    pub index_bytes: u64,
+    /// 索引条目数
+    pub index_entries: usize,
+    /// 有序索引占用的字节数（近似值）
+    pub ordered_index_bytes: u64,
+    /// 惰性删除条目占用的字节数（近似值）
+    pub lazy_deleted_bytes: u64,
+    /// 惰性删除的条目数
+    pub lazy_deleted_entries: usize,
+    /// 预读队列占用的字节数（近似值）
+    pub prefetch_queue_bytes: u64,
+    /// 预读队列的大小
+    pub prefetch_queue_size: usize,
+    /// MMAP文件大小（虚拟内存）
+    pub mmap_bytes: u64,
+    /// 总堆内存使用量（字节）
+    pub total_heap_bytes: u64,
+    /// 内存使用比例（0.0-1.0）
+    pub memory_usage_ratio: f64,
+    /// 是否处于内存压力状态
+    pub under_memory_pressure: bool,
+    /// 缓存驱逐次数
+    pub cache_evictions: u64,
+    /// 强制驱逐次数
+    pub forced_evictions: u64,
+}
+
+/// 内存限制配置
+#[derive(Debug, Clone)]
+pub struct MemoryLimitConfig {
+    /// 堆内存软限制（字节）
+    pub heap_soft_limit: u64,
+    /// 堆内存硬限制（字节）
+    pub heap_hard_limit: u64,
+    /// L1缓存硬限制（字节）
+    pub l1_cache_hard_limit: u64,
+    /// L1缓存条目硬限制
+    pub l1_cache_entry_hard_limit: usize,
+    /// 单次最大驱逐比例（0.0-1.0）
+    pub max_eviction_percent: f64,
+    /// 内存压力时是否拒绝写入
+    pub reject_writes_under_pressure: bool,
+    /// 内存检查间隔（毫秒）
+    pub check_interval_ms: u64,
+}
+
+impl Default for MemoryLimitConfig {
+    fn default() -> Self {
+        Self {
+            // 默认堆内存软限制：100MB
+            heap_soft_limit: 100 * 1024 * 1024,
+            // 默认堆内存硬限制：200MB
+            heap_hard_limit: 200 * 1024 * 1024,
+            // 默认L1缓存硬限制：50MB
+            l1_cache_hard_limit: 50 * 1024 * 1024,
+            // 默认L1缓存条目限制：10000
+            l1_cache_entry_hard_limit: 10_000,
+            // 默认最大驱逐比例：10%
+            max_eviction_percent: 0.1,
+            // 默认内存压力时拒绝写入
+            reject_writes_under_pressure: true,
+            // 默认检查间隔：1000ms（1秒）
+            check_interval_ms: 1_000,
+        }
+    }
+}
+
 /// 高性能无锁 MMAP 磁盘存储
 ///
 /// # 核心无锁优化
@@ -134,11 +190,17 @@ pub struct HighPerfMmapStorage {
     index: Arc<DashMap<String, (u64, u64)>>,
 
     /// 【关键改造1】写映射仍用 RwLock（写入时需要独占）
+    /// 【保留】写映射仍需锁保护（写入本身需要独占）
     mmap_rw: Arc<parking_lot::RwLock<Option<MmapMut>>>,
 
     /// 【关键改造2】读映射改用 ArcSwap：读路径完全无锁！
     /// 读者通过 load() 获取 Arc<Mmap>，无需任何锁
-    mmap_ro: Arc<ArcSwap<Option<Arc<Mmap>>>>,
+    // mmap_ro: Arc<ArcSwap<Option<Arc<Mmap>>>>,
+    mmap_ro: Arc<ArcSwapOption<Mmap>>,
+
+    /// 【新增】读者计数器：追踪有多少读线程正在使用映射
+    /// 使用 AtomicU64 比 RwLock 性能更好
+    active_readers: Arc<AtomicU64>,
 
     active_writers: Arc<AtomicU64>,
     resize_lock: Mutex<()>,
@@ -157,7 +219,6 @@ pub struct HighPerfMmapStorage {
 
     config: HighPerfMmapConfig,
 
-    // lazy_deleted_entries: Arc<DashMap<String, (u64, u64)>>,
     /// 【修复】惰性删除条目：offset -> (key, size)
     /// 使用 offset 作为键，避免同一 key 多次覆盖时信息丢失
     lazy_deleted_entries: Arc<DashMap<u64, (String, u64)>>,
@@ -167,6 +228,15 @@ pub struct HighPerfMmapStorage {
 
     shutdown: Arc<AtomicBool>,
     prefetch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+
+    cache_evictions: Arc<AtomicU64>,
+    forced_evictions: Arc<AtomicU64>,
+    last_memory_check: Arc<AtomicU64>,
+
+    memory_limit : MemoryLimitConfig,
+    /// 内存监控后台线程句柄
+    memory_monitor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// 【关键改造4】原子化的统计结构
@@ -241,6 +311,7 @@ impl Default for AtomicStats {
         }
     }
 }
+
 
 /// 统计快照结构（用于读取）
 #[derive(Debug, Clone)]
@@ -400,7 +471,242 @@ impl<'a> Drop for WriterGuard<'a> {
     }
 }
 
+// ========== 核心修复1：读取时增加引用计数 ==========
+
+/// 【RAII守卫】自动管理读者计数
+struct ReaderGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl ReaderGuard {
+    #[inline]
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Acquire);
+        Self { counter }
+    }
+}
+
+impl Drop for ReaderGuard {
+    #[inline]
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl HighPerfMmapStorage {
+
+    // ========== 核心修复1：读取时增加引用计数 ==========
+    /// 【新增】获取详细的内存统计信息
+    pub fn get_memory_stats(&self) -> MemoryStats {
+        // L1缓存统计
+        let l1_bytes = self.hot_cache_bytes.load(Ordering::Relaxed);
+        let l1_entries = self.hot_cache.len();
+
+        // 索引统计（每个条目约：String(平均20字节) + (u64, u64) = 36字节）
+        let index_entries = self.index.len();
+        let index_bytes = (index_entries * 36) as u64;
+
+        // 有序索引统计（每个条目约：u64 + String(20字节) = 28字节）
+        let ordered_entries = {
+            let ord = self.ordered_index.read();
+            ord.len()
+        };
+        let ordered_index_bytes = (ordered_entries * 28) as u64;
+
+        // 惰性删除表统计
+        let lazy_entries = self.lazy_deleted_entries.len();
+        let lazy_deleted_bytes = (lazy_entries * 36) as u64;
+
+        // 预读队列统计（每个条目约：String(20字节)）
+        let prefetch_size = self.prefetch_queue.len();
+        let prefetch_queue_bytes = (prefetch_size * 20) as u64;
+
+        // MMAP文件大小
+        let mmap_bytes = self.data_file_size.load(Ordering::Relaxed);
+
+        // 总堆内存（不含MMAP，因为MMAP是虚拟内存）
+        let total_heap = l1_bytes
+            + index_bytes
+            + ordered_index_bytes
+            + lazy_deleted_bytes
+            + prefetch_queue_bytes;
+
+        let usage_ratio = total_heap as f64 / self.memory_limit.heap_hard_limit as f64;
+        let under_pressure = usage_ratio > 0.8;
+
+        MemoryStats {
+            l1_cache_bytes: l1_bytes,
+            l1_cache_entries: l1_entries,
+            index_bytes,
+            index_entries,
+            ordered_index_bytes,
+            lazy_deleted_bytes,
+            lazy_deleted_entries: lazy_entries,
+            prefetch_queue_bytes,
+            prefetch_queue_size: prefetch_size,
+            mmap_bytes,
+            total_heap_bytes: total_heap,
+            memory_usage_ratio: usage_ratio,
+            under_memory_pressure: under_pressure,
+            cache_evictions: self.cache_evictions.load(Ordering::Relaxed),
+            forced_evictions: self.forced_evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 【新增】检查并执行内存控制策略
+    fn check_memory_limits(&self) -> io::Result<()> {
+        let stats = self.get_memory_stats();
+
+        // 检查是否超过软限制
+        if stats.total_heap_bytes > self.memory_limit.heap_soft_limit {
+            // 计算需要释放的字节数
+            let target = self.memory_limit.heap_soft_limit * 85 / 100; // 目标：降到85%
+            let to_free = stats.total_heap_bytes.saturating_sub(target);
+
+            info!(
+                "内存软限制触发: 当前{}MB, 限制{}MB, 需释放{}MB",
+                stats.total_heap_bytes / 1024 / 1024,
+                self.memory_limit.heap_soft_limit / 1024 / 1024,
+                to_free / 1024 / 1024
+            );
+
+            self.evict_cache_by_size(to_free, false)?;
+        }
+
+        // 检查是否超过硬限制（紧急情况）
+        if stats.total_heap_bytes > self.memory_limit.heap_hard_limit {
+            let to_free = stats.total_heap_bytes.saturating_sub(
+                self.memory_limit.heap_hard_limit * 75 / 100  // 强制降到75%
+            );
+
+            log::error!(
+                "内存硬限制触发！当前{}MB, 限制{}MB, 强制释放{}MB",
+                stats.total_heap_bytes / 1024 / 1024,
+                self.memory_limit.heap_hard_limit / 1024 / 1024,
+                to_free / 1024 / 1024
+            );
+
+            self.forced_evictions.fetch_add(1, Ordering::Relaxed);
+            self.evict_cache_by_size(to_free, true)?;
+
+            // 触发GC回收惰性删除的空间
+            if stats.lazy_deleted_entries > 100 {
+                let _ = self.garbage_collect();
+            }
+        }
+
+        // 检查L1缓存是否超限
+        if stats.l1_cache_bytes > self.memory_limit.l1_cache_hard_limit
+            || stats.l1_cache_entries > self.memory_limit.l1_cache_entry_hard_limit {
+            let to_free = stats.l1_cache_bytes.saturating_sub(
+                self.memory_limit.l1_cache_hard_limit * 90 / 100
+            );
+            self.evict_cache_by_size(to_free, false)?;
+        }
+
+        Ok(())
+    }
+
+    /// 【新增】按大小驱逐缓存
+    fn evict_cache_by_size(&self, target_bytes: u64, aggressive: bool) -> io::Result<()> {
+        if target_bytes == 0 {
+            return Ok(());
+        }
+
+        let cache_size = self.hot_cache.len();
+        if cache_size == 0 {
+            return Ok(());
+        }
+
+        // 计算采样大小
+        let sample_size = if aggressive {
+            cache_size  // 激进模式：扫描全部
+        } else {
+            // 限制单次驱逐百分比
+            let max_evict = (cache_size as f64 * self.memory_limit.max_eviction_percent) as usize;
+            std::cmp::min(cache_size, std::cmp::max(max_evict, 100))
+        };
+
+        // 收集待驱逐的条目（按LRU排序）
+        let mut entries: Vec<(String, Instant, u64)> = Vec::with_capacity(sample_size);
+        let mut count = 0;
+
+        for entry in self.hot_cache.iter() {
+            entries.push((
+                entry.key().clone(),
+                entry.value().last_access,
+                entry.value().size,
+            ));
+            count += 1;
+            if count >= sample_size {
+                break;
+            }
+        }
+
+        // 按最后访问时间排序（最旧的优先驱逐）
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // 执行驱逐
+        let mut freed = 0u64;
+        let mut evicted_count = 0u64;
+
+        for (key, _time, size) in entries {
+            if freed >= target_bytes {
+                break;
+            }
+
+            if let Some((_k, cached)) = self.hot_cache.remove(&key) {
+                self.hot_cache_bytes.fetch_sub(cached.size, Ordering::Relaxed);
+                freed = freed.saturating_add(size);
+                evicted_count += 1;
+            }
+        }
+
+        self.cache_evictions.fetch_add(evicted_count, Ordering::Relaxed);
+
+        debug!(
+            "缓存驱逐完成: 释放{}MB ({} 条目), 剩余{}MB ({} 条目)",
+            freed / 1024 / 1024,
+            evicted_count,
+            self.hot_cache_bytes.load(Ordering::Relaxed) / 1024 / 1024,
+            self.hot_cache.len()
+        );
+
+        Ok(())
+    }
+
+    /// 【新增】清空所有缓存（JNI关闭前调用）
+    pub fn clear_all_caches(&self) {
+        info!("清空所有缓存...");
+
+        // 清空L1缓存
+        let count = self.hot_cache.len();
+        self.hot_cache.clear();
+        self.hot_cache_bytes.store(0, Ordering::Relaxed);
+
+        // 清空预读队列
+        while let Some(_) = self.prefetch_queue.pop() {}
+        self.prefetch_set.clear();
+
+        info!("已清空 {} 个缓存条目", count);
+    }
+
+    /// 【新增】获取内存压力等级（供JNI调用方监控）
+    pub fn get_memory_pressure_level(&self) -> u8 {
+        let stats = self.get_memory_stats();
+        let ratio = stats.memory_usage_ratio;
+
+        if ratio < 0.6 {
+            0  // 正常
+        } else if ratio < 0.75 {
+            1  // 警告
+        } else if ratio < 0.9 {
+            2  // 压力
+        } else {
+            3  // 危险
+        }
+    }
+
     /// 【核心压缩逻辑】智能压缩数据
     /// 返回 (实际存储的数据, 是否已压缩, 原始大小)
     fn compress_if_beneficial(&self, data: &[u8]) -> io::Result<(Vec<u8>, bool, usize)> {
@@ -574,10 +880,44 @@ impl HighPerfMmapStorage {
 
     /// 【无锁优化】读取 mmap 的核心方法：完全无锁
     #[inline]
-    fn load_mmap_ro(&self) -> Option<Arc<Mmap>> {
-        // ArcSwap::load() 是完全无锁的原子操作
-        // 返回的是 Arc 的克隆，引用计数原子递增
-        self.mmap_ro.load().as_ref().as_ref().cloned()
+    fn load_mmap_ro(&self) -> Option<(Arc<Mmap>, ReaderGuard)> {
+        // 先增加读者计数（防止并发释放）
+        let guard = ReaderGuard::new(Arc::clone(&self.active_readers));
+
+        // 尝试加载映射，带短暂自旋（最多 10μs）
+        const MAX_SPIN_ATTEMPTS: u32 = 100;  // 约 1-2μs
+        const MAX_YIELD_ATTEMPTS: u32 = 10;   // 约 10μs
+
+        let mut spins = 0u32;
+        let mut yields = 0u32;
+
+        loop {
+            if let Some(mmap) = self.mmap_ro.load_full() {
+                return Some((mmap, guard));
+            }
+
+            // 第一阶段：快速自旋（避免线程切换）
+            if spins < MAX_SPIN_ATTEMPTS {
+                std::hint::spin_loop();
+                spins += 1;
+                continue;
+            }
+
+            // 第二阶段：让出CPU时间片
+            if yields < MAX_YIELD_ATTEMPTS {
+                std::thread::yield_now();
+                yields += 1;
+                continue;
+            }
+
+            // 超过阈值仍未加载：记录错误并返回
+            // 这种情况理论上不应该发生（除非存储正在关闭）
+            log::error!(
+                "load_mmap_ro: 自旋 {} 次后仍无法加载映射，可能存储正在关闭",
+                spins + yields
+            );
+            return None;
+        }
     }
 
     fn write_data_at_offset_once(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -656,7 +996,7 @@ impl HighPerfMmapStorage {
     }
 
     fn remap_mmap_locked(&self) -> std::io::Result<()> {
-        // 【关键修复】先创建新映射，再原子替换，避免 None 窗口期
+        // 【关键改进】先创建新映射，再替换，永不出现 None 状态
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -665,15 +1005,46 @@ impl HighPerfMmapStorage {
         let mmap_w = unsafe { MmapMut::map_mut(&file)? };
         let mmap_r = unsafe { Mmap::map(&file)? };
 
-        // 先更新写映射
+        // 原子替换读映射（旧映射仍然有效，由 Arc 引用计数保护）
+        let old_mmap = self.mmap_ro.swap(Some(Arc::new(mmap_r)));
+
+        // 更新写映射
         {
             let mut w = self.mmap_rw.write();
             *w = Some(mmap_w);
         }
 
-        // 【关键】直接原子替换为新映射，不经过 None 状态
-        // 旧映射的引用计数会自动递减，当所有读者释放后自动回收
-        self.mmap_ro.store(Arc::new(Some(Arc::new(mmap_r))));
+        // 等待所有正在使用旧映射的读者退出
+        if old_mmap.is_some() {
+            let start = Instant::now();
+            let mut spins = 0u32;
+
+            while self.active_readers.load(Ordering::Acquire) > 0 {
+                if spins < 1000 {
+                    std::hint::spin_loop();
+                    spins += 1;
+                } else {
+                    std::thread::yield_now();
+                    spins = 0;
+
+                    // 超过 10ms 仍有读者，记录警告
+                    if start.elapsed().as_millis() > 10 {
+                        log::warn!(
+                            "remap_mmap_locked: 等待读者超过 10ms，当前读者数 = {}",
+                            self.active_readers.load(Ordering::Relaxed)
+                        );
+                    }
+
+                    // 超过 1 秒，强制继续（可能有 bug）
+                    if start.elapsed().as_secs() > 1 {
+                        log::error!(
+                            "remap_mmap_locked: 等待读者超时（1秒），强制继续"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
 
         self.stats.mmap_remaps.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -683,6 +1054,8 @@ impl HighPerfMmapStorage {
         let _g = self.map_lock.write();
         self.remap_mmap_locked()
     }
+
+    // ========== 核心修复4：文件扩展时不需要设置为 None ==========
 
     fn expand_file_locked_if_needed(&self, required: u64) -> std::io::Result<()> {
         if required > self.config.max_file_size {
@@ -713,6 +1086,8 @@ impl HighPerfMmapStorage {
         let new_size = std::cmp::min(target, self.config.max_file_size);
 
         let t0 = Instant::now();
+
+        // 扩展文件
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -720,11 +1095,11 @@ impl HighPerfMmapStorage {
         file.set_len(new_size)?;
         file.sync_all()?;
 
+        // 重新映射（内部会处理旧映射的释放）
         self.remap_mmap()?;
 
         self.data_file_size.store(new_size, Ordering::Relaxed);
 
-        // 【无锁统计更新】
         self.stats.file_expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.maintenance_expand_events.fetch_add(1, Ordering::Relaxed);
         self.stats.expand_us_total.fetch_add(
@@ -735,22 +1110,41 @@ impl HighPerfMmapStorage {
         Ok(())
     }
 
+    /// 【关键修复】加载 mmap 的方法，带短暂重试机制
+    #[inline]
+    fn load_mmap_ro_with_retry(&self, max_attempts: u32) -> Option<Arc<Mmap>> {
+        for attempt in 0..max_attempts {
+            if let Some(mmap) = self.mmap_ro.load_full() {
+                return Some(mmap);
+            }
+
+            // 短暂自旋等待（避免线程切换开销）
+            if attempt < 3 {
+                for _ in 0..8 {
+                    std::hint::spin_loop();
+                }
+            } else {
+                // 超过3次尝试后让出CPU
+                std::thread::yield_now();
+            }
+        }
+        None
+    }
     /// 【核心方法：完全无锁的读取】
+    /// 【修复】读取方法 - 添加重试逻辑
     pub fn read(&self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
         let start_time = Instant::now();
 
-        // L1 缓存检查（DashMap 内部是分段锁，读取很快）
+        // L1 缓存检查
         if let Some(mut cached_data) = self.hot_cache.get_mut(key) {
             if cached_data.access_count == 0 {
                 self.stats.prefetch_served_hits.fetch_add(1, Ordering::Relaxed);
             }
-
             cached_data.access_count += 1;
             cached_data.last_access = Instant::now();
             let data_len = cached_data.data.len();
             let elapsed = start_time.elapsed().as_micros() as u64;
 
-            // 【无锁统计更新】
             self.stats.l1_cache_hits.fetch_add(1, Ordering::Relaxed);
             self.stats.total_reads.fetch_add(1, Ordering::Relaxed);
             self.stats.total_read_bytes.fetch_add(data_len as u64, Ordering::Relaxed);
@@ -759,25 +1153,25 @@ impl HighPerfMmapStorage {
             return Ok(Some(cached_data.data.clone()));
         }
 
-        // 【关键：完全无锁的索引+映射获取】
+        // 索引查询
         let (offset, _tot) = match self.index.get(key) {
             Some(v) => *v,
             None => return Ok(None),
         };
 
-        // 【关键：无锁加载 mmap】不需要 map_lock！
-        let mmap = match self.load_mmap_ro() {
-            Some(m) => m,
+        // 【关键】使用增强的加载方法（带自旋）
+        let (mmap, _guard) = match self.load_mmap_ro() {
+            Some(pair) => pair,
             None => {
                 self.record_error("mmap_uninitialized_read");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "MMAP not initialized",
+                    "MMAP not initialized after spin wait",
                 ));
             }
         };
 
-        // 从 mmap 读取数据（纯内存操作，无锁）
+        // 读取数据
         let data = match Self::read_data_from_mmap_static(&mmap, offset) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -786,10 +1180,9 @@ impl HighPerfMmapStorage {
             Err(e) => return Err(e),
         };
 
-        // 加入缓存
         self.add_to_hot_cache_sync(key, &data);
 
-        // 触发预读
+        // 预读逻辑
         if self.config.enable_prefetch {
             if let Some((off, _)) = self.index.get(key).map(|v| *v) {
                 let ord = self.ordered_index.read();
@@ -813,7 +1206,7 @@ impl HighPerfMmapStorage {
             }
         }
 
-        // 【无锁统计更新】
+        // 统计
         let elapsed = start_time.elapsed().as_micros() as u64;
         self.stats.l1_cache_misses.fetch_add(1, Ordering::Relaxed);
         self.stats.total_reads.fetch_add(1, Ordering::Relaxed);
@@ -822,6 +1215,7 @@ impl HighPerfMmapStorage {
 
         Ok(Some(data))
     }
+
 
     /// 【无锁优化】批量读取
     pub fn read_batch_coalesced(
@@ -836,6 +1230,7 @@ impl HighPerfMmapStorage {
         let mut l1_hits: u64 = 0;
         let mut l1_bytes: u64 = 0;
 
+        // L1 缓存检查
         for k in keys {
             if let Some(mut cached) = self.hot_cache.get_mut(k) {
                 if cached.access_count == 0 {
@@ -864,9 +1259,9 @@ impl HighPerfMmapStorage {
             return Ok(out);
         }
 
-        // 【无锁加载 mmap】
-        let mut mmap_arc = match self.load_mmap_ro() {
-            Some(m) => m,
+        // 【关键】使用增强加载
+        let (mmap_arc, _guard) = match self.load_mmap_ro() {
+            Some(pair) => pair,
             None => {
                 self.record_error("mmap_uninitialized_read");
                 return Err(std::io::Error::new(
@@ -876,6 +1271,7 @@ impl HighPerfMmapStorage {
             }
         };
 
+        // 后续逻辑保持不变...
         let mut committed_size = |m: &Mmap, off: u64| -> std::io::Result<usize> {
             let len = m.len();
             let start = off as usize;
@@ -906,25 +1302,19 @@ impl HighPerfMmapStorage {
         };
 
         misses.sort_by_key(|it| it.1);
-
         let mut blocks: Vec<(String, usize, usize)> = Vec::with_capacity(misses.len());
         let mut miss_bytes: u64 = 0;
-
-        let mut ensure_mmap_len = |need_end: usize, arc: &mut Arc<Mmap>| -> std::io::Result<()> {
-            if need_end <= arc.len() { return Ok(()); }
-            if let Some(new_m) = self.load_mmap_ro() {
-                *arc = new_m;
-                if need_end <= arc.len() { return Ok(()); }
-            }
-            self.record_error("read_data_oob");
-            Err(Error::new(ErrorKind::UnexpectedEof, "data out of bounds"))
-        };
 
         for (k, off) in &misses {
             let size = committed_size(&*mmap_arc, *off)?;
             let data_off = (*off as usize) + HEADER_SIZE;
             let data_end = data_off + size;
-            ensure_mmap_len(data_end, &mut mmap_arc)?;
+
+            if data_end > mmap_arc.len() {
+                self.record_error("read_data_oob");
+                return Err(Error::new(ErrorKind::UnexpectedEof, "data out of bounds"));
+            }
+
             blocks.push((k.clone(), data_off, size));
         }
 
@@ -994,6 +1384,7 @@ impl HighPerfMmapStorage {
         Ok(out)
     }
 
+
     pub fn read_batch(&self, keys: &[String]) -> std::io::Result<HashMap<String, Vec<u8>>> {
         self.read_batch_coalesced(keys, DEFAULT_COALESCE_GAP)
     }
@@ -1005,9 +1396,8 @@ impl HighPerfMmapStorage {
             None => return Ok(None),
         };
 
-        // 【无锁加载 mmap】
-        let mmap = match self.load_mmap_ro() {
-            Some(m) => m,
+        let (mmap, _guard) = match self.load_mmap_ro() {
+            Some(pair) => pair,
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -1054,20 +1444,52 @@ impl HighPerfMmapStorage {
 
     pub fn write(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
         let start_all = Instant::now();
+
+        // 【新增】写入前检查内存限制
+        if self.memory_limit.reject_writes_under_pressure {
+            let pressure = self.get_memory_pressure_level();
+            if pressure >= 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "内存压力过高，拒绝写入"
+                ));
+            }
+        }
+
+        // 【新增】定期检查内存（每秒最多一次，避免频繁检查）
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let last_check = self.last_memory_check.load(Ordering::Relaxed);
+        let check_interval_ns = self.memory_limit.check_interval_ms * 1_000_000;
+
+        if now_ns.saturating_sub(last_check) > check_interval_ns {
+            if self.last_memory_check.compare_exchange(
+                last_check,
+                now_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed
+            ).is_ok() {
+                // 异步检查，不阻塞写入
+                let _ = self.check_memory_limits();
+            }
+        }
+
         let _wg = WriterGuard::new(&self.active_writers);
 
         // 【关键：智能压缩】
         let (actual_data, compressed, original_size) = self.compress_if_beneficial(data)?;
 
         let total = HEADER_SIZE as u64 + actual_data.len() as u64;
-        let max_file_size = self.config.max_file_size;
+        let maxf = self.config.max_file_size;
 
         let offset = match self.write_offset.fetch_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |cur| {
                 let needed = cur.saturating_add(total);
-                if needed > max_file_size { None } else { Some(needed) }
+                if needed > maxf { None } else { Some(needed) }
             },
         ) {
             Ok(prev) => prev,
@@ -1078,7 +1500,7 @@ impl HighPerfMmapStorage {
                     Ordering::SeqCst,
                     |cur| {
                         let needed = cur.saturating_add(total);
-                        if needed > max_file_size { None } else { Some(needed) }
+                        if needed > maxf { None } else { Some(needed) }
                     },
                 ) {
                     Ok(prev2) => prev2,
@@ -1107,17 +1529,40 @@ impl HighPerfMmapStorage {
         self.expand_file_locked_if_needed(required)?;
 
         let start_path = Instant::now();
-        // 【修改：写入的是压缩后的数据，但头部需要记录压缩标志】
         self.write_data_at_offset_retry_compressed(offset, &actual_data, compressed)?;
         let path_ns = start_path.elapsed().as_nanos() as u64;
         let path_us = (path_ns + 999) / 1000;
 
+        // 【关键修复】写入成功后，立即使缓存失效
+        // 必须在索引更新前删除，避免竞态
+        if let Some((_k, old_cached)) = self.hot_cache.remove(key) {
+            self.hot_cache_bytes.fetch_sub(old_cached.size, Ordering::Relaxed);
+        }
+
+        // 更新索引，标记旧数据为删除
         if let Some((old_off, old_sz)) = self.index.insert(key.to_string(), (offset, total)) {
-            self.lazy_deleted_entries.insert(old_off , (key.to_string() , old_sz));
+            // 以旧的 offset 为键存储，避免同 key 多次覆盖时信息丢失
+            self.lazy_deleted_entries.insert(old_off, (key.to_string(), old_sz));
+
             let mut by_end = self.lazy_by_end.write();
             by_end.insert(old_off + old_sz, (key.to_string(), (old_off, old_sz)));
         }
         self.ordered_index.write().insert(offset, key.to_string());
+
+        // 【可选优化】立即将新数据加入缓存，提高后续读取性能
+        // 但要检查内存是否充足
+        let mem_stats = self.get_memory_stats();
+        if mem_stats.memory_usage_ratio < 0.8 {  // 只在内存充足时预热
+            if compressed {
+                // 如果数据被压缩了，需要解压后再缓存
+                if let Ok(decompressed) = self.decompress_data(&actual_data, self.config.compression.algorithm) {
+                    self.add_to_hot_cache_sync(key, &decompressed);
+                }
+            } else {
+                // 未压缩，直接缓存
+                self.add_to_hot_cache_sync(key, &actual_data);
+            }
+        }
 
         // 【统计：记录原始大小，不是压缩后的】
         self.stats.total_writes.fetch_add(1, Ordering::Relaxed);
@@ -1286,6 +1731,7 @@ impl HighPerfMmapStorage {
         Ok(deleted_count)
     }
 
+    /// 【根本性修复】尾部收缩 - 保持旧映射可用直到新映射就绪
     fn try_shrink_tail(&self) -> std::io::Result<()> {
         if self.active_writers.load(Ordering::Relaxed) > 0 {
             return Ok(());
@@ -1296,6 +1742,7 @@ impl HighPerfMmapStorage {
             return Ok(());
         }
 
+        // 计算需要回收的空间
         let mut reclaimed: u64 = 0;
         loop {
             let mut by_end = self.lazy_by_end.write();
@@ -1309,36 +1756,63 @@ impl HighPerfMmapStorage {
             }
         }
 
-        if reclaimed > 0 {
-            let _rl = self.resize_lock.lock();
-            let _ml = self.map_lock.write();
-
-            self.write_offset.store(tail, Ordering::Relaxed);
-            self.data_file_size.store(tail, Ordering::Relaxed);
-
-            // 【关键修复】先释放写映射，但保持读映射可用
-            {
-                let mut w = self.mmap_rw.write();
-                let _ = w.take();
-            }
-
-            // 【注意】不要设置读映射为 None！保持旧映射可用，直到新映射创建完成
-
-            // 截断文件
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&self.data_file_path)?;
-            file.set_len(tail)?;
-            file.sync_all()?;
-            drop(file);
-
-            // 【关键】创建新映射并原子替换，避免 None 窗口期
-            self.remap_mmap_locked()?;
-
-            self.stats.reclaimed_disk_space.fetch_add(reclaimed, Ordering::Relaxed);
-            info!("删除收缩: 回收尾部 {} 字节, 新文件大小 {}", reclaimed, tail);
+        if reclaimed == 0 {
+            return Ok(());
         }
+
+        let _rl = self.resize_lock.lock();
+        let _ml = self.map_lock.write();
+
+        // 【关键】等待所有读者退出
+        let start = Instant::now();
+        let mut spins = 0u32;
+
+        while self.active_readers.load(Ordering::Acquire) > 0 {
+            if spins < 10000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+                spins = 0;
+
+                // 超过 100ms 仍有读者，放弃收缩
+                if start.elapsed().as_millis() > 100 {
+                    log::warn!(
+                        "try_shrink_tail: 等待读者超过 100ms，放弃收缩"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // 更新偏移
+        self.write_offset.store(tail, Ordering::Relaxed);
+        self.data_file_size.store(tail, Ordering::Relaxed);
+
+        // 释放写映射
+        {
+            let mut w = self.mmap_rw.write();
+            let _ = w.take();
+        }
+
+        // 【关键】设为 None，阻止新读者（旧读者已退出）
+        let _old = self.mmap_ro.swap(None);
+
+        // 截断文件
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.data_file_path)?;
+        file.set_len(tail)?;
+        file.sync_all()?;
+        drop(file);
+
+        // 立即重建映射（恢复可用状态）
+        self.remap_mmap_locked()?;
+
+        self.stats.reclaimed_disk_space.fetch_add(reclaimed, Ordering::Relaxed);
+        info!("删除收缩: 回收尾部 {} 字节, 新文件大小 {}", reclaimed, tail);
+
         Ok(())
     }
 
@@ -1348,7 +1822,6 @@ impl HighPerfMmapStorage {
 
         let mut lazy_bytes: u64 = 0;
         for e in self.lazy_deleted_entries.iter() {
-            // let (_off, size) = *e.value();
             let (_key, size) = e.value();   // 新结构：(key, size)
             lazy_bytes = lazy_bytes.saturating_add(*size);
             if lazy_bytes >= self.config.growth_step {
@@ -1364,9 +1837,9 @@ impl HighPerfMmapStorage {
     fn compact_data_file(&self, valid_entries: &HashMap<String, (u64, u64)>) -> std::io::Result<u64> {
         let temp_file_path = self.data_file_path.with_extension("tmp");
         let mut temp_file = File::create(&temp_file_path)?;
-
         let original_size = self.data_file_size.load(Ordering::Relaxed);
 
+        // 读取并复制数据
         let file = OpenOptions::new().read(true).open(&self.data_file_path)?;
         let mmap_ro = unsafe { memmap2::Mmap::map(&file)? };
 
@@ -1385,7 +1858,6 @@ impl HighPerfMmapStorage {
             }
 
             let header_bytes = &mmap_ro[start..end_header];
-
             let data_offset = end_header;
             let data_end = data_offset + (size - header_size) as usize;
             if data_end > mmap_ro.len() {
@@ -1409,12 +1881,41 @@ impl HighPerfMmapStorage {
         let _rl = self.resize_lock.lock();
         let _ml = self.map_lock.write();
 
-        // 【关键修复】先释放写映射，但保持读映射可用
+        // 【关键】等待所有读者退出（增加超时检测）
+        let start = Instant::now();
+        let mut spins = 0u32;
+
+        while self.active_readers.load(Ordering::Acquire) > 0 {
+            if spins < 10000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+                spins = 0;
+
+                // 每秒输出一次日志
+                if start.elapsed().as_secs() > 0 && spins == 0 {
+                    log::warn!(
+                        "compact_data_file: 等待读者超过 {} 秒，当前读者数 = {}",
+                        start.elapsed().as_secs(),
+                        self.active_readers.load(Ordering::Relaxed)
+                    );
+                }
+
+                // 超过 10 秒，放弃 GC
+                if start.elapsed().as_secs() > 10 {
+                    log::error!("compact_data_file: 等待读者超时（10秒），放弃 GC");
+                    return Ok(0);
+                }
+            }
+        }
+
+        // 释放映射
         {
             let mut w = self.mmap_rw.write();
             let _ = w.take();
         }
-        // 【注意】不要清空读映射！保持旧映射可用，直到新文件准备好
+        let _old = self.mmap_ro.swap(None);
 
         // 替换文件
         std::fs::rename(&temp_file_path, &self.data_file_path)?;
@@ -1422,9 +1923,10 @@ impl HighPerfMmapStorage {
         let new_file_size = new_offset;
         self.data_file_size.store(new_file_size, Ordering::Relaxed);
 
-        // 【关键】创建新映射并原子替换
+        // 重新创建映射
         self.remap_mmap_locked()?;
 
+        // 更新索引
         self.index.clear();
         {
             let mut ord = self.ordered_index.write();
@@ -1436,6 +1938,7 @@ impl HighPerfMmapStorage {
         }
         self.lazy_by_end.write().clear();
 
+        // 扩展文件
         let step = self.config.growth_step.max(1);
         let reserve = (self.config.growth_reserve_steps.saturating_sub(1) as u64) * step;
         let boost: u64 = 2;
@@ -1444,6 +1947,23 @@ impl HighPerfMmapStorage {
 
         if target_after_gc > new_file_size {
             let t0 = std::time::Instant::now();
+
+            // 再次等待读者（扩展前）
+            let start = Instant::now();
+            while self.active_readers.load(Ordering::Acquire) > 0 {
+                std::hint::spin_loop();
+                if start.elapsed().as_millis() > 100 {
+                    log::warn!("compact_data_file: 扩展前等待读者超时");
+                    break;
+                }
+            }
+
+            {
+                let mut w = self.mmap_rw.write();
+                let _ = w.take();
+            }
+            let _old = self.mmap_ro.swap(None);
+
             let f = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1468,6 +1988,7 @@ impl HighPerfMmapStorage {
         );
         Ok(reclaimed_space)
     }
+
 
     /// 【无锁优化】获取统计快照
     pub fn get_stats(&self) -> HighPerfMmapStats {
@@ -1538,6 +2059,15 @@ impl HighPerfMmapStorage {
     }
 
     pub fn new(disk_dir: PathBuf, config: HighPerfMmapConfig) -> std::io::Result<Self> {
+        Self::new_with_memory_limit(disk_dir, config, MemoryLimitConfig::default())
+    }
+
+    /// 【新增】带内存限制配置的构造函数（推荐JNI使用）
+    pub fn new_with_memory_limit(
+        disk_dir: PathBuf,
+        config: HighPerfMmapConfig,
+        memory_limit: MemoryLimitConfig,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&disk_dir)?;
 
         let data_file_path = disk_dir.join("data.bin");
@@ -1567,7 +2097,8 @@ impl HighPerfMmapStorage {
             write_offset: Arc::new(AtomicU64::new(0)),
             index: Arc::new(DashMap::new()),
             mmap_rw: Arc::new(parking_lot::RwLock::new(None)),
-            mmap_ro: Arc::new(ArcSwap::from_pointee(None)),
+            mmap_ro: Arc::new(ArcSwapOption::empty()), // 【改用 ArcSwapOption】
+            active_readers: Arc::new(AtomicU64::new(0)), // 【新增】
             active_writers: Arc::new(AtomicU64::new(0)),
             resize_lock: Mutex::new(()),
             map_lock: parking_lot::RwLock::new(()),
@@ -1589,10 +2120,22 @@ impl HighPerfMmapStorage {
             )),
             shutdown: Arc::new(AtomicBool::new(false)),
             prefetch_thread: Mutex::new(None),
+            memory_limit,
+            cache_evictions: Arc::new(AtomicU64::new(0)),
+            forced_evictions: Arc::new(AtomicU64::new(0)),
+            memory_monitor_thread: Mutex::new(None),
+            last_memory_check: Arc::new(AtomicU64::new(0)),
         };
 
         storage.load_index()?;
         storage.initialize_mmap()?;
+
+        info!(
+            "初始化存储 - 堆内存限制: 软={} MB, 硬={} MB, L1缓存={} MB",
+            storage.memory_limit.heap_soft_limit / 1024 / 1024,
+            storage.memory_limit.heap_hard_limit / 1024 / 1024,
+            storage.memory_limit.l1_cache_hard_limit / 1024 / 1024
+        );
 
         Ok(storage)
     }
@@ -1608,7 +2151,7 @@ impl HighPerfMmapStorage {
         *w = Some(mmap_w);
 
         let mmap_r = unsafe { Mmap::map(&file)? };
-        self.mmap_ro.store(Arc::new(Some(Arc::new(mmap_r))));
+        self.mmap_ro.store(Some(Arc::new(mmap_r))); // 【直接 store】
 
         Ok(())
     }
@@ -1743,8 +2286,8 @@ impl HighPerfMmapStorage {
                         store.prefetch_set.remove(&key);
 
                         if let Some(entry) = store.index.get(&key) {
-                            // 【无锁加载 mmap】
-                            if let Some(mmap) = store.load_mmap_ro() {
+                            // 【关键】使用增强加载
+                            if let Some((mmap, _guard)) = store.load_mmap_ro() {
                                 if let Ok(data) = Self::read_data_from_mmap_static(&mmap, entry.0) {
                                     let need = data.len() as u64;
                                     let used = store.hot_cache_bytes.load(Ordering::Relaxed);
@@ -1830,7 +2373,7 @@ impl HighPerfMmapStorage {
     /// 【新增】从 mmap 读取并根据需要解压
     fn read_and_decompress(&self, offset: u64) -> io::Result<Vec<u8>> {
         // 先无锁加载 mmap
-        let mmap = match self.load_mmap_ro() {
+        let (mmap , reader_guard) = match self.load_mmap_ro() {
             Some(m) => m,
             None => {
                 self.record_error("mmap_uninitialized_read");
@@ -1867,12 +2410,38 @@ impl HighPerfMmapStorage {
 
 impl Drop for HighPerfMmapStorage {
     fn drop(&mut self) {
+        info!("开始清理存储资源...");
+
+        // 停止所有后台线程
         self.shutdown.store(true, Ordering::Relaxed);
+
         if let Some(h) = self.prefetch_thread.get_mut().take() {
             let _ = h.join();
         }
 
+        if let Some(h) = self.memory_monitor_thread.get_mut().take() {
+            let _ = h.join();
+        }
+
+        // 输出最终内存统计
+        let mem_stats = self.get_memory_stats();
+        info!(
+            "最终内存统计: 总堆={}MB, L1缓存={}MB/{} 条目, 索引={} 条目, 驱逐={} 次(强制{})",
+            mem_stats.total_heap_bytes / 1024 / 1024,
+            mem_stats.l1_cache_bytes / 1024 / 1024,
+            mem_stats.l1_cache_entries,
+            mem_stats.index_entries,
+            mem_stats.cache_evictions,
+            mem_stats.forced_evictions
+        );
+
+        // 清空所有缓存
+        self.clear_all_caches();
+
+        // 刷盘并保存索引
         let _ = self.flush();
         let _ = self.save_index();
+
+        info!("存储资源清理完成");
     }
 }

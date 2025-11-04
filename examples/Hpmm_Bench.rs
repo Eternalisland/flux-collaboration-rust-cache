@@ -121,10 +121,14 @@ fn config_from_profile(mut cfg: HighPerfMmapConfig, profile: &str) -> HighPerfMm
 
 #[derive(Default, Clone)]
 struct ThreadStats {
-    writes: u64,
-    reads: u64,
-    deletes: u64,
-    batches: u64,
+    write_attempts: u64,
+    write_success: u64,
+    read_attempts: u64,
+    read_hits: u64,
+    delete_attempts: u64,
+    delete_success: u64,
+    batch_attempts: u64,
+    batch_success: u64,
     read_lat_us: Vec<u64>,
     write_lat_us: Vec<u64>,
 }
@@ -154,35 +158,22 @@ fn main() -> std::io::Result<()> {
     let args = parse_args();
     fs::create_dir_all(&args.dir)?;
 
-
-    #[cfg(debug_assertions)]
-    std::thread::spawn(|| loop {
-        std::thread::sleep(std::time::Duration::from_secs(10));
-        let deadlocks = parking_lot::deadlock::check_deadlock();
-        if !deadlocks.is_empty() {
-            eprintln!("⚠️ detected deadlocks: {}", deadlocks.len());
-            for (i, threads) in deadlocks.iter().enumerate() {
-                eprintln!("deadlock #{}", i);
-                for t in threads {
-                    eprintln!(" - thread id: {:?}\n - backtrace:\n{:?}", t.thread_id(), t.backtrace());
-                }
-            }
-        }
-    });
     
     let mut cfg = HighPerfMmapConfig::default();
     cfg = config_from_profile(cfg, &args.profile);
     if let Some(pf) = args.prefetch { cfg.enable_prefetch = pf; }
 
     // 推荐：首文件 512MB，步长 128MB（可按需改）
-    cfg.initial_file_size = 1024 * 1024 * 1024;
-    cfg.growth_step = 512 * 1024 * 1024;
-    cfg.max_file_size = 64 * 1024 * 1024 * 1024; // 64GB
+    cfg.initial_file_size = 1024 * 1024 * 1024 * 10;
+    cfg.growth_step = 1024 * 1024 * 1024;
+    cfg.max_file_size = 100 * 1024 * 1024 * 1024; // 100GB
+    cfg.enable_prefetch = true;
 
     println!("== Config ==\n{:?}", cfg);
 
     let store = Arc::new(HighPerfMmapStorage::new(args.dir.clone(), cfg.clone())?);
     store.start_background_tasks();
+    let stats_before = store.get_stats();
     // 运行标志与全局 key 计数
     let running = Arc::new(AtomicBool::new(true));
     let next_id = Arc::new(AtomicU64::new(0));
@@ -205,11 +196,18 @@ fn main() -> std::io::Result<()> {
                 let id = next_id.fetch_add(1, Ordering::Relaxed) %  args.keyspace;
                 let key = format!("k_{}", id);
                 let val = rand_value(&mut rng, vmean, vmax);
+                ts.write_attempts += 1;
                 let st = Instant::now();
-                let _ = s.write(&key, &val);
-                let us = st.elapsed().as_micros() as u64;
-                ts.writes += 1;
-                ts.write_lat_us.push(us);
+                match s.write(&key, &val) {
+                    Ok(_) => {
+                        let us = st.elapsed().as_micros() as u64;
+                        ts.write_success += 1;
+                        ts.write_lat_us.push(us);
+                    }
+                    Err(_) => {
+                        // 失败时不记录延迟，按照 attempts 统计
+                    }
+                }
             }
             ts
         });
@@ -231,18 +229,27 @@ fn main() -> std::io::Result<()> {
                     let hi = next_id.load(Ordering::Relaxed).max(1);
                     let id = rng.gen_range(0..hi.min( args.keyspace ));
                     let key = format!("k_{}", id);
+                    ts.read_attempts += 1;
                     let st = Instant::now();
-                    let _ = s.read(&key);
-                    let us = st.elapsed().as_micros() as u64;
-                    ts.reads += 1;
-                    ts.read_lat_us.push(us);
-                } else if dice < 90 { // delete
+                    match s.read(&key) {
+                        Ok(Some(_)) => {
+                            let us = st.elapsed().as_micros() as u64;
+                            ts.read_hits += 1;
+                            ts.read_lat_us.push(us);
+                        }
+                        Ok(None) | Err(_) => {
+                            // miss 或错误：只统计尝试次数
+                        }
+                    }
+                } else if dice  < 100 { // delete
+                    ts.delete_attempts += 1;
                     let hi = next_id.load(Ordering::Relaxed).max(1);
                     let id = rng.gen_range(0..hi.min( args.keyspace ));
                     let key = format!("k_{}", id);
-                    let _ = s.delete(&key);
-                    ts.deletes += 1;
-                } else { // batch read
+                    if matches!(s.delete(&key), Ok(true)) {
+                        ts.delete_success += 1;
+                    }
+                } /*else { // batch read
                     let hi = next_id.load(Ordering::Relaxed).max(1);
                     let mut keys = Vec::with_capacity(batch_n);
                     for _ in 0..batch_n { 
@@ -252,9 +259,10 @@ fn main() -> std::io::Result<()> {
                     let st = Instant::now();
                     let _ = s.read_batch(&keys);
                     let us = st.elapsed().as_micros() as u64;
-                    ts.batches += 1;
+                    ts.batch_attempts += 1;
+                    ts.batch_success += 1; // treat as hit when batch succeeds
                     ts.read_lat_us.push(us); // 将一次批量当作一次读事件计时
-                }
+                }*/
             }
             ts
         });
@@ -273,9 +281,18 @@ fn main() -> std::io::Result<()> {
 
     // 汇总
     let mut total = ThreadStats::default();
-    for h in handles { let ts = h.join().unwrap();
-        total.writes += ts.writes; total.reads += ts.reads; total.deletes += ts.deletes; total.batches += ts.batches;
-        total.read_lat_us.extend(ts.read_lat_us); total.write_lat_us.extend(ts.write_lat_us);
+    for h in handles {
+        let ts = h.join().unwrap();
+        total.write_attempts += ts.write_attempts;
+        total.write_success += ts.write_success;
+        total.read_attempts += ts.read_attempts;
+        total.read_hits += ts.read_hits;
+        total.delete_attempts += ts.delete_attempts;
+        total.delete_success += ts.delete_success;
+        total.batch_attempts += ts.batch_attempts;
+        total.batch_success += ts.batch_success;
+        total.read_lat_us.extend(ts.read_lat_us);
+        total.write_lat_us.extend(ts.write_lat_us);
     }
 
     // 刷盘、保存索引、尝试一次 GC
@@ -287,16 +304,51 @@ fn main() -> std::io::Result<()> {
     let pf_after = get_page_faults();
 
     // 输出指标
+    let stats_after = store.get_stats();
+    let mem_stats = store.get_memory_stats();
+
+    let reads_success = stats_after.total_reads.saturating_sub(stats_before.total_reads);
+    let writes_success = stats_after.total_writes.saturating_sub(stats_before.total_writes);
+    let total_success_ops = reads_success
+        .saturating_add(writes_success)
+        .saturating_add(total.delete_success)
+        .saturating_add(total.batch_success);
+
+    let total_attempt_ops = total.read_attempts
+        .saturating_add(total.write_attempts)
+        .saturating_add(total.delete_attempts)
+        .saturating_add(total.batch_attempts);
+
     let secs = bench_secs as f64;
-    let ops = (total.reads + total.writes + total.deletes + total.batches) as f64;
-    let rps = (total.reads as f64) / secs;
-    let wps = (total.writes as f64) / secs;
+    let reads_per_sec = reads_success as f64 / secs;
+    let writes_per_sec = writes_success as f64 / secs;
+    let deletes_per_sec = total.delete_success as f64 / secs;
+    let total_per_sec = total_success_ops as f64 / secs;
 
     println!("\n==== RESULTS ====\nDuration: {} s", bench_secs);
-    println!("Ops: total={} (reads={} writes={} deletes={} batches={})",
-             total.reads + total.writes + total.deletes + total.batches,
-             total.reads, total.writes, total.deletes, total.batches);
-    println!("Throughput: reads={:.2}/s writes={:.2}/s total={:.2}/s", rps, wps, ops / secs);
+    println!(
+        "Ops (attempted): total={} (reads={} writes={} deletes={} batches={})",
+        total_attempt_ops,
+        total.read_attempts,
+        total.write_attempts,
+        total.delete_attempts,
+        total.batch_attempts
+    );
+    println!(
+        "Ops (successful): total={} (reads={} writes={} deletes={} batches={})",
+        total_success_ops,
+        reads_success,
+        writes_success,
+        total.delete_success,
+        total.batch_success
+    );
+    println!(
+        "Throughput (successful ops): reads={:.2}/s writes={:.2}/s deletes={:.2}/s total={:.2}/s",
+        reads_per_sec,
+        writes_per_sec,
+        deletes_per_sec,
+        total_per_sec
+    );
 
     // 计算分位
     let mut r = total.read_lat_us.clone();
@@ -317,8 +369,15 @@ fn main() -> std::io::Result<()> {
     }
 
     // 打印内部统计（如有）
-    let stats = store.get_stats();
-    println!("\nInternal Stats: {:?}", stats);
+    println!("\nInternal Stats: {:?}", stats_after);
+    println!(
+        "Memory Usage: total_heap={:.2} MB, L1_cache={:.2} MB (entries={}), mmap_size={:.2} MB, under_pressure={}",
+        mem_stats.total_heap_bytes as f64 / (1024.0 * 1024.0),
+        mem_stats.l1_cache_bytes as f64 / (1024.0 * 1024.0),
+        mem_stats.l1_cache_entries,
+        mem_stats.mmap_bytes as f64 / (1024.0 * 1024.0),
+        mem_stats.under_memory_pressure
+    );
 
     store.stop_background_tasks();
     Ok(())

@@ -1,10 +1,49 @@
 use jni::JNIEnv;
-use jni::objects::{JClass, JString, JByteArray, JObject, JObjectArray};
-use jni::sys::{jstring, jbyteArray, jlong, jboolean, jdouble, jobjectArray};
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jboolean, jbyteArray, jdouble, jlong, jstring};
 use std::path::PathBuf;
-use crate::high_perf_mmap_storage::{HighPerfMmapStorage, HighPerfMmapConfig};
+use std::sync::Arc;
+
+use crate::high_perf_mmap_storage::{
+    HighPerfMmapConfig,
+    HighPerfMmapStatus,
+    HighPerfMmapStorage,
+    MemoryLimitConfig,
+};
 use serde::Deserialize;
-use async_std::sync::Arc;
+use serde_json;
+
+type ResultBox<T> = Result<T, Box<dyn std::error::Error>>;
+
+fn create_storage_handle(
+    disk_path: PathBuf,
+    config: HighPerfMmapConfig,
+    memory_limit: MemoryLimitConfig,
+    clear_on_start: bool,
+) -> ResultBox<jlong> {
+    std::fs::create_dir_all(&disk_path)?;
+
+    let storage = Arc::new(HighPerfMmapStorage::new_with_options(
+        disk_path,
+        config,
+        memory_limit,
+        clear_on_start,
+    )?);
+    storage.start_background_tasks();
+
+    Ok(Box::into_raw(Box::new(storage)) as jlong)
+}
+
+fn storage_from_ptr<'a>(storage_ptr: jlong) -> Result<&'a Arc<HighPerfMmapStorage>, &'static str> {
+    if storage_ptr == 0 {
+        return Err("storage pointer is null");
+    }
+    unsafe {
+        (storage_ptr as *const Arc<HighPerfMmapStorage>)
+            .as_ref()
+            .ok_or("storage pointer is invalid")
+    }
+}
 
 /// DatahubRustJniCache 的 JNI 桥接实现
 /// 对应 Java 类：com.flux.collaboration.utils.cache.rust.jni.DatahubRustJniCache
@@ -25,31 +64,21 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     enable_prefetch: jboolean,
     prefetch_queue_size: jlong,
 ) -> jlong {
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
-        // 转换 Java 字符串为 Rust 字符串
+    let result = (|| -> ResultBox<jlong> {
         let disk_dir_str: String = env.get_string(&disk_dir)?.into();
         let disk_path = PathBuf::from(disk_dir_str);
-        
-        // 创建目录
-        std::fs::create_dir_all(&disk_path)?;
-        
-        // 创建配置
+
         let mut config = HighPerfMmapConfig::default();
-        config.initial_file_size = initial_file_size as u64;
-        config.growth_step = growth_step as u64;
-        config.max_file_size = max_file_size as u64;
+        config.initial_file_size = initial_file_size.max(0) as u64;
+        config.growth_step = growth_step.max(0) as u64;
+        config.max_file_size = max_file_size.max(0) as u64;
         config.enable_compression = enable_compression != 0;
         config.enable_prefetch = enable_prefetch != 0;
-        config.prefetch_queue_size = prefetch_queue_size as usize;
-        
-        //  // 创建存储实例
-        let storage = Arc::new(HighPerfMmapStorage::new(disk_path, config)?);
-        // 2) 启动后台任务（方案 B：方法签名是 `self: &Arc<Self>`）
-        storage.start_background_tasks();
-        
-        // 句柄类型是 *mut Arc<HighPerfMmapStorage>
-        let storage_ptr = Box::into_raw(Box::new(storage));
-        Ok(storage_ptr as jlong)
+        if prefetch_queue_size > 0 {
+            config.prefetch_queue_size = prefetch_queue_size as usize;
+        }
+
+        create_storage_handle(disk_path, config, MemoryLimitConfig::default(), false)
     })();
     
     match result {
@@ -71,29 +100,14 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     disk_dir: JString,
 ) -> jlong {
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
-        // 转换 Java 字符串为 Rust 字符串
+    let result = (|| -> ResultBox<jlong> {
         let disk_dir_str: String = env.get_string(&disk_dir)?.into();
         let disk_path = PathBuf::from(disk_dir_str);
-        
-        // 创建目录
-        std::fs::create_dir_all(&disk_path)?;
-        
-        // 使用默认配置
+
         let config = HighPerfMmapConfig::default();
-        
-        // 创建存储实例
-        // let storage = HighPerfMmapStorage::new(disk_path, config)?;
-        // let storage_ptr = Box::into_raw(Box::new(storage));
-        
-       //  // 创建存储实例
-       let storage = Arc::new(HighPerfMmapStorage::new(disk_path, config)?);
-       // 2) 启动后台任务（方案 B：方法签名是 `self: &Arc<Self>`）
-       storage.start_background_tasks();
-       
-       // 句柄类型是 *mut Arc<HighPerfMmapStorage>
-       let storage_ptr = Box::into_raw(Box::new(storage));
-       Ok(storage_ptr as jlong)
+        let memory = MemoryLimitConfig::default();
+
+        create_storage_handle(disk_path, config, memory, false)
     })();
     
     match result {
@@ -131,11 +145,17 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     json_config: JString,
 ) -> jlong {
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     struct IncomingConfig {
         disk_dir: String,
+        #[serde(default)] clear_on_start: bool,
+        #[serde(default)] config: Option<HighPerfMmapConfig>,
+        #[serde(default)] memory_limit: Option<MemoryLimitConfig>,
+        #[serde(default)] compression: Option<crate::high_perf_mmap_storage::CompressionConfig>,
+
         #[serde(default)] initial_file_size: Option<u64>,
         #[serde(default)] growth_step: Option<u64>,
+        #[serde(default)] growth_reserve_steps: Option<u32>,
         #[serde(default)] max_file_size: Option<u64>,
         #[serde(default)] enable_compression: Option<bool>,
         #[serde(default)] l1_cache_size_limit: Option<u64>,
@@ -146,21 +166,28 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         #[serde(default)] prefetch_queue_size: Option<usize>,
         #[serde(default)] memory_pressure_threshold: Option<f64>,
         #[serde(default)] cache_degradation_threshold: Option<f64>,
+
+        #[serde(default)] heap_soft_limit: Option<u64>,
+        #[serde(default)] heap_hard_limit: Option<u64>,
+        #[serde(default)] l1_cache_hard_limit: Option<u64>,
+        #[serde(default)] l1_cache_entry_hard_limit: Option<usize>,
+        #[serde(default)] max_eviction_percent: Option<f64>,
+        #[serde(default)] reject_writes_under_pressure: Option<bool>,
+        #[serde(default)] check_interval_ms: Option<u64>,
     }
 
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
+    let result = (|| -> ResultBox<jlong> {
         // 解析 JSON
         let json_str: String = env.get_string(&json_config)?.into();
         let incoming: IncomingConfig = serde_json::from_str(&json_str)?;
 
         // 目录
         let disk_path = PathBuf::from(&incoming.disk_dir);
-        std::fs::create_dir_all(&disk_path)?;
 
-        // 合并默认配置与覆盖项
-        let mut cfg = HighPerfMmapConfig::default();
+        let mut cfg = incoming.config.unwrap_or_default();
         if let Some(v) = incoming.initial_file_size { cfg.initial_file_size = v; }
         if let Some(v) = incoming.growth_step { cfg.growth_step = v; }
+        if let Some(v) = incoming.growth_reserve_steps { cfg.growth_reserve_steps = v; }
         if let Some(v) = incoming.max_file_size { cfg.max_file_size = v; }
         if let Some(v) = incoming.enable_compression { cfg.enable_compression = v; }
         if let Some(v) = incoming.l1_cache_size_limit { cfg.l1_cache_size_limit = v; }
@@ -171,18 +198,18 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         if let Some(v) = incoming.prefetch_queue_size { cfg.prefetch_queue_size = v; }
         if let Some(v) = incoming.memory_pressure_threshold { cfg.memory_pressure_threshold = v; }
         if let Some(v) = incoming.cache_degradation_threshold { cfg.cache_degradation_threshold = v; }
+        if let Some(v) = incoming.compression { cfg.compression = v; }
 
-        // 创建存储实例
-        // let storage = HighPerfMmapStorage::new(disk_path, cfg)?;
-        // let storage_ptr = Box::into_raw(Box::new(storage));
-       //  // 创建存储实例
-       let storage = Arc::new(HighPerfMmapStorage::new(disk_path, cfg)?);
-       // 2) 启动后台任务（方案 B：方法签名是 `self: &Arc<Self>`）
-       storage.start_background_tasks();
-       
-       // 句柄类型是 *mut Arc<HighPerfMmapStorage>
-       let storage_ptr = Box::into_raw(Box::new(storage));
-       Ok(storage_ptr as jlong)
+        let mut memory = incoming.memory_limit.unwrap_or_default();
+        if let Some(v) = incoming.heap_soft_limit { memory.heap_soft_limit = v; }
+        if let Some(v) = incoming.heap_hard_limit { memory.heap_hard_limit = v; }
+        if let Some(v) = incoming.l1_cache_hard_limit { memory.l1_cache_hard_limit = v; }
+        if let Some(v) = incoming.l1_cache_entry_hard_limit { memory.l1_cache_entry_hard_limit = v; }
+        if let Some(v) = incoming.max_eviction_percent { memory.max_eviction_percent = v; }
+        if let Some(v) = incoming.reject_writes_under_pressure { memory.reject_writes_under_pressure = v; }
+        if let Some(v) = incoming.check_interval_ms { memory.check_interval_ms = v; }
+
+        create_storage_handle(disk_path, cfg, memory, incoming.clear_on_start)
     })();
 
     match result {
@@ -206,31 +233,15 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     key: JString,
     data: JByteArray,
 ) -> jboolean {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
-    
-    let result = (|| -> Result<jboolean, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        // 转换 Java 字符串为 Rust 字符串
-        let key_str: String = env.get_string(&key)?.into();
+    let result = (|| -> ResultBox<jboolean> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
-        // 转换 Java 字节数组为 Rust 字节切片
+        let key_str: String = env.get_string(&key)?.into();
         let data_bytes = env.convert_byte_array(&data)?;
 
-        let write_result = unsafe {
-            let storage =  &*(storage_ptr as *const Arc<HighPerfMmapStorage>);
-            // 执行写入操作
-            storage.write(&key_str, &data_bytes)
-                .map(|_| true)  // 成功时返回 true
-                .map_err(|e| e.into())  // 转换错误类型;
-        };
-        match write_result {
-            Ok(success) => Ok(1),
-            Err(e) =>  Err(e), // 处理错误
-        } // 成功返回 true
+        storage.write(&key_str, &data_bytes)?;
+        Ok(1)
     })();
     
     match result {
@@ -253,30 +264,18 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     storage_ptr: jlong,
     key: JString,
 ) -> jbyteArray {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return std::ptr::null_mut();
-    }
-    
-    let result = (|| -> Result<jbyteArray, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        
-        // 转换 Java 字符串为 Rust 字符串
+    let result = (|| -> ResultBox<jbyteArray> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+
         let key_str: String = env.get_string(&key)?.into();
-        
-        // 执行读取操作
+
         match storage.read(&key_str)? {
             Some(data) => {
-                // 将 Rust 字节向量转换为 Java 字节数组
                 let java_array = env.byte_array_from_slice(&data)?;
                 Ok(java_array.into_raw())
             }
-            None => {
-                // 数据不存在，返回 null
-                Ok(std::ptr::null_mut())
-            }
+            None => Ok(std::ptr::null_mut()),
         }
     })();
     
@@ -300,19 +299,12 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     storage_ptr: jlong,
     key: JString,
 ) -> jboolean {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
+    let result = (|| -> ResultBox<jboolean> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
-    let result = (|| -> Result<jboolean, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 转换 Java 字符串为 Rust 字符串
         let key_str: String = env.get_string(&key)?.into();
 
-        // 执行删除操作
         let removed = storage.delete(&key_str)?;
         Ok(if removed { 1 } else { 0 })
     })();
@@ -328,163 +320,21 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     }
 }
 
-/// 批量写入数据
-/// 对应 Java 方法：public static native boolean writeBatch(long storagePtr, String[] keys, byte[][] dataArray)
+/// 获取状态信息（读写删除 + 内存）
+/// 对应 Java 方法：public static native String getStatus(long storagePtr)
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_writeBatch(
-    mut env: JNIEnv,
-    _class: JClass,
-    storage_ptr: jlong,
-    keys: JObjectArray,
-    data_array: JObjectArray,
-) -> jboolean {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
-    
-    let result = (|| -> Result<jboolean, Box<dyn std::error::Error>> {
-        // 获取存储实例
-    
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 获取数组长度
-        let keys_len = env.get_array_length(&keys)?;
-        let data_len = env.get_array_length(&data_array)?;
-        
-        if keys_len != data_len {
-            return Err("Keys and data arrays must have the same length".into());
-        }
-        
-        // 批量写入数据
-        for i in 0..keys_len {
-            let key_obj = env.get_object_array_element(&keys, i)?;
-            let key_str: String = env.get_string(&key_obj.into())?.into();
-            
-            let data_obj = env.get_object_array_element(&data_array, i)?;
-            let data_bytes = env.convert_byte_array(&JByteArray::from(data_obj))?;
-            
-            storage.write(&key_str, &data_bytes)?;
-        }
-        
-        Ok(1) // 成功返回 true
-    })();
-    
-    match result {
-        Ok(success) => success,
-        Err(e) => {
-            let error_msg = format!("Failed to write batch data: {}", e);
-            env.throw_new("java/lang/RuntimeException", &error_msg)
-                .unwrap_or_default();
-            0
-        }
-    }
-}
-
-/// 批量读取数据
-/// 对应 Java 方法：public static native byte[][] readBatch(long storagePtr, String[] keys)
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_readBatch(
-    mut env: JNIEnv,
-    _class: JClass,
-    storage_ptr: jlong,
-    keys: JObjectArray,
-) -> jobjectArray {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return std::ptr::null_mut();
-    }
-    
-    let result = (|| -> Result<jobjectArray, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 获取键数组长度
-        let keys_len = env.get_array_length(&keys)?;
-        
-        // 创建结果数组
-        let result_array = env.new_object_array(keys_len, "[B", JObject::default())?;
-        
-        // 批量读取数据
-        for i in 0..keys_len {
-            let key_obj = env.get_object_array_element(&keys, i)?;
-            let key_str: String = env.get_string(&key_obj.into())?.into();
-            
-            match storage.read(&key_str)? {
-                Some(data) => {
-                    let java_array = env.byte_array_from_slice(&data)?;
-                    env.set_object_array_element(&result_array, i, &JObject::from(java_array))?;
-                }
-                None => {
-                    // 数据不存在，设置为 null
-                    env.set_object_array_element(&result_array, i, &JObject::default())?;
-                }
-            }
-        }
-        
-        Ok(result_array.into_raw())
-    })();
-    
-    match result {
-        Ok(result_array) => result_array,
-        Err(e) => {
-            let error_msg = format!("Failed to read batch data: {}", e);
-            env.throw_new("java/lang/RuntimeException", &error_msg)
-                .unwrap_or_default();
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// 获取统计信息
-/// 对应 Java 方法：public static native String getStats(long storagePtr)
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_getStats(
+pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_getStatus(
     mut env: JNIEnv,
     _class: JClass,
     storage_ptr: jlong,
 ) -> jstring {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return std::ptr::null_mut();
-    }
-    
-    let result = (|| -> Result<jstring, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        
-        // 获取统计信息
-        let stats = storage.get_stats();
-        
-        // 格式化统计信息为 JSON 字符串
-        let stats_json = serde_json::json!({
-            "total_writes": stats.total_writes,
-            "total_reads": stats.total_reads,
-            "total_write_bytes": stats.total_write_bytes,
-            "total_read_bytes": stats.total_read_bytes,
-            "l1_cache_hits": stats.l1_cache_hits,
-            "l1_cache_misses": stats.l1_cache_misses,
-            "l2_cache_hits": stats.l2_cache_hits,
-            "l2_cache_misses": stats.l2_cache_misses,
-            "prefetch_hits": stats.prefetch_hits,
-            "avg_write_latency_us": stats.avg_write_latency_us,
-            "avg_read_latency_us": stats.avg_read_latency_us,
-            "mmap_remaps": stats.mmap_remaps,
-            "l1_cache_hit_rate": if stats.l1_cache_hits + stats.l1_cache_misses > 0 {
-                stats.l1_cache_hits as f64 / (stats.l1_cache_hits + stats.l1_cache_misses) as f64 * 100.0
-            } else {
-                0.0
-            },
-            "l2_cache_hit_rate": if stats.l2_cache_hits + stats.l2_cache_misses > 0 {
-                stats.l2_cache_hits as f64 / (stats.l2_cache_hits + stats.l2_cache_misses) as f64 * 100.0
-            } else {
-                0.0
-            }
-        });
-        
-        let stats_str = stats_json.to_string();
-        let java_string = env.new_string(&stats_str)?;
+    let result = (|| -> ResultBox<jstring> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+
+        let status: HighPerfMmapStatus = storage.get_status();
+        let status_json = serde_json::to_string(&status)?;
+        let java_string = env.new_string(&status_json)?;
         Ok(java_string.into_raw())
     })();
     
@@ -497,6 +347,21 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
             std::ptr::null_mut()
         }
     }
+}
+
+/// 兼容旧接口：getStats 调用 getStatus
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_getStats(
+    env: JNIEnv,
+    class: JClass,
+    storage_ptr: jlong,
+) -> jstring {
+    let env = env;
+    Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_getStatus(
+        env,
+        class,
+        storage_ptr,
+    )
 }
 
 /// 保存索引
@@ -512,15 +377,15 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
             .unwrap_or_default();
         return 0;
     }
-    
-    let result = (|| -> Result<jboolean, Box<dyn std::error::Error>> {
+
+    let result = (|| -> ResultBox<jboolean> {
         // 获取存储实例
-        let storage = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        
-        // 保存索引
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+
         storage.save_index()?;
-        
-        Ok(1) // 成功返回 true
+
+        Ok(1)
     })();
     
     match result {
@@ -544,9 +409,10 @@ pub  extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_Datahub
 ) {
     if storage_ptr != 0 {
         unsafe {
-            let boxed: Box<Arc<HighPerfMmapStorage>> = Box::from_raw(storage_ptr as *mut Arc<HighPerfMmapStorage>);
-            boxed.stop_background_tasks();   // 调用在 &Arc 上：(*boxed).stop_background_tasks() 也行
-            // 离开作用域后 drop(boxed)：Arc 引用计数 -1，若为最后一个则释放底层对象
+            let boxed: Box<Arc<HighPerfMmapStorage>> =
+                Box::from_raw(storage_ptr as *mut Arc<HighPerfMmapStorage>);
+            Arc::as_ref(&boxed).stop_background_tasks();
+            // drop(boxed) at end of scope, decrementing Arc count
         }
     }
 }
@@ -559,15 +425,9 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     storage_ptr: jlong,
 ) -> jboolean {
-    if storage_ptr == 0 {
-        return 0;
-    }
-    
-    // 简单检查指针是否有效
-    unsafe {
-        let storage = &*(storage_ptr as *const Arc<HighPerfMmapStorage>);
-        // 这里可以添加更多的有效性检查
-        std::ptr::addr_of!(*storage).is_null() as jboolean
+    match storage_from_ptr(storage_ptr) {
+        Ok(_) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -579,26 +439,19 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     storage_ptr: jlong,
 ) -> jdouble {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0.0;
-    }
-    
-    let result = (|| -> Result<jdouble, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
+    let result = (|| -> ResultBox<jdouble> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
-        // 获取统计信息
         let stats = storage.get_stats();
-        
-        // 计算缓存命中率 (使用 L1 缓存命中率)
-        let hit_rate = if stats.l1_cache_hits + stats.l1_cache_misses > 0 {
-            stats.l1_cache_hits as f64 / (stats.l1_cache_hits + stats.l1_cache_misses) as f64 * 100.0
+
+        let total = stats.l1_cache_hits + stats.l1_cache_misses;
+        let hit_rate = if total > 0 {
+            (stats.l1_cache_hits as f64 / total as f64) * 100.0
         } else {
             0.0
         };
-        
+
         Ok(hit_rate)
     })();
     
@@ -621,18 +474,12 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     storage_ptr: jlong,
 ) -> jlong {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
-    
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 获取统计信息
+    let result = (|| -> ResultBox<jlong> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+
         let stats = storage.get_stats();
-        
+
         Ok(stats.avg_read_latency_us as jlong)
     })();
     
@@ -655,18 +502,12 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     storage_ptr: jlong,
 ) -> jlong {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
-    
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
-        // 获取存储实例
-     let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 获取统计信息
+    let result = (|| -> ResultBox<jlong> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
+
         let stats = storage.get_stats();
-        
+
         Ok(stats.avg_write_latency_us as jlong)
     })();
     
@@ -689,16 +530,10 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     _class: JClass,
     storage_ptr: jlong,
 ) -> jlong {
-    if storage_ptr == 0 {
-        env.throw_new("java/lang/IllegalArgumentException", "Storage pointer is null")
-            .unwrap_or_default();
-        return 0;
-    }
+    let result = (|| -> ResultBox<jlong> {
+        let storage = storage_from_ptr(storage_ptr)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
-    let result = (|| -> Result<jlong, Box<dyn std::error::Error>> {
-        // 获取存储实例
-        let storage: &Arc<HighPerfMmapStorage> = unsafe { &*(storage_ptr as *const Arc<HighPerfMmapStorage>) };
-        // 执行垃圾回收，返回清理条目数
         let deleted_count = storage.garbage_collect()?;
         Ok(deleted_count as jlong)
     })();

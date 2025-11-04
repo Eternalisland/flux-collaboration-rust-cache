@@ -1,3 +1,5 @@
 /target
 webui/node_modules
 /webui/node_modules/
+/benchdata/data.bin
+/benchdata/index.bin

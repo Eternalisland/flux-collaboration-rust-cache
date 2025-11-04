@@ -167,7 +167,8 @@ fn main() -> std::io::Result<()> {
     cfg.initial_file_size = 1024 * 1024 * 1024 * 10;
     cfg.growth_step = 1024 * 1024 * 1024;
     cfg.max_file_size = 100 * 1024 * 1024 * 1024; // 100GB
-    cfg.enable_prefetch = true;
+    cfg.enable_prefetch = false;
+    // cfg.auto_purge_after_secs = None;
 
     println!("== Config ==\n{:?}", cfg);
 

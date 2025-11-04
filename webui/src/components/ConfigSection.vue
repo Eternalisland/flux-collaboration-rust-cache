@@ -32,6 +32,14 @@
       <n-form-item-gi :span="12" label="降级阈值">
         <span class="form-value">{{ formatPercent(config.cacheDegradationThreshold, 0) }}</span>
       </n-form-item-gi>
+      <n-form-item-gi :span="12" label="自动清理阈值">
+        <span class="form-value">{{ formatAutoPurge(config.autoPurgeAfterSecs) }}</span>
+      </n-form-item-gi>
+      <n-form-item-gi :span="12" label="清理检查间隔">
+        <span class="form-value">
+          {{ formatInterval(config.autoPurgeCheckIntervalSecs) }}
+        </span>
+      </n-form-item-gi>
     </n-grid>
   </n-form>
 </template>
@@ -44,6 +52,21 @@ import { formatBytes, formatPercent } from '../utils/formatters';
 defineProps<{
   config: HighPerfMmapConfig;
 }>();
+
+function formatAutoPurge(secs: number | null): string {
+  if (secs == null || Number.isNaN(secs)) return '关闭';
+  if (secs === 0) return '立即';
+  if (secs % 3600 === 0) return `${secs / 3600} 小时`;
+  if (secs % 60 === 0) return `${secs / 60} 分钟`;
+  return `${secs} 秒`;
+}
+
+function formatInterval(secs: number): string {
+  if (!secs) return '每次写入';
+  if (secs % 3600 === 0) return `${secs / 3600} 小时`;
+  if (secs % 60 === 0) return `${secs / 60} 分钟`;
+  return `${secs} 秒`;
+}
 </script>
 
 <style scoped>

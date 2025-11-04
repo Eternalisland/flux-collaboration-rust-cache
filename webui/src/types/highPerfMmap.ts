@@ -25,6 +25,8 @@ export interface HighPerfMmapConfig {
   memoryPressureThreshold: number;
   cacheDegradationThreshold: number;
   compression: CompressionConfig;
+  autoPurgeAfterSecs: number | null;
+  autoPurgeCheckIntervalSecs: number;
 }
 
 export interface MemoryStats {

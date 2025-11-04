@@ -235,6 +235,8 @@ const fallbackData: InstanceViewModel[] = reactive([
       prefetchQueueSize: 100,
       memoryPressureThreshold: 0.8,
       cacheDegradationThreshold: 0.9,
+      autoPurgeAfterSecs: 8 * 3600,
+      autoPurgeCheckIntervalSecs: 300,
       compression: {
         enabled: true,
         algorithm: 'Lz4',
@@ -306,6 +308,8 @@ const fallbackData: InstanceViewModel[] = reactive([
       prefetchQueueSize: 0,
       memoryPressureThreshold: 0.7,
       cacheDegradationThreshold: 0.85,
+      autoPurgeAfterSecs: null,
+      autoPurgeCheckIntervalSecs: 0,
       compression: {
         enabled: false,
         algorithm: 'None',
@@ -499,7 +503,15 @@ function normalizeConfig(payload: Record<string, unknown>): HighPerfMmapConfig {
     cacheDegradationThreshold: numberish(
       payload.cacheDegradationThreshold ?? payload['cache_degradation_threshold']
     ),
-    compression: normalizeCompression(compressionPayload)
+    compression: normalizeCompression(compressionPayload),
+    autoPurgeAfterSecs: (() => {
+      const raw =
+        payload.autoPurgeAfterSecs ?? payload['auto_purge_after_secs'] ?? null;
+      return raw == null ? null : numberish(raw);
+    })(),
+    autoPurgeCheckIntervalSecs: numberish(
+      payload.autoPurgeCheckIntervalSecs ?? payload['auto_purge_check_interval_secs'] ?? 0
+    )
   };
 }
 

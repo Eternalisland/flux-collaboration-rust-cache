@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use memmap2::{Mmap, MmapMut};
@@ -309,6 +310,7 @@ pub struct HighPerfMmapStorage {
     lazy_by_end: Arc<parking_lot::RwLock<BTreeMap<u64, (String, (u64, u64))>>>,
     ordered_index: Arc<parking_lot::RwLock<BTreeMap<u64, String>>>,
     next_gc_time: Arc<AtomicU64>,
+    last_purge_check: Arc<AtomicU64>,
 
     shutdown: Arc<AtomicBool>,
     prefetch_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -453,6 +455,10 @@ pub struct HighPerfMmapConfig {
     pub cache_degradation_threshold: f64,
     /// 新增：详细的压缩配置
     pub compression: CompressionConfig,
+    /// 自动过期清理阈值（秒），None 表示禁用
+    pub auto_purge_after_secs: Option<u64>,
+    /// 过期清理检查周期（秒），0 表示每次都检查
+    pub auto_purge_check_interval_secs: u64,
 }
 
 impl Default for HighPerfMmapConfig {
@@ -472,6 +478,9 @@ impl Default for HighPerfMmapConfig {
             memory_pressure_threshold: 0.8,
             cache_degradation_threshold: 0.9,
             compression: CompressionConfig::default(),
+            // 默认 保留 8 小时数据
+            auto_purge_after_secs: Some(28800),
+            auto_purge_check_interval_secs: 300,
         }
     }
 }
@@ -1670,7 +1679,7 @@ impl HighPerfMmapStorage {
         }
 
         // 创建写者守卫，增加活跃写者计数
-        let _wg = WriterGuard::new(&self.active_writers);
+        let writer_guard = WriterGuard::new(&self.active_writers);
 
         // 【关键：智能压缩】
         // 根据配置决定是否对数据进行压缩，返回实际存储的数据、是否已压缩、原始大小
@@ -1795,6 +1804,10 @@ impl HighPerfMmapStorage {
             start_all.elapsed().as_micros() as u64,
         );
         update_ema_atomic(&self.stats.avg_write_path_us, path_us);
+
+        drop(writer_guard);
+
+        self.trigger_gc_if_needed();
 
         Ok(())
     }
@@ -2067,6 +2080,40 @@ impl HighPerfMmapStorage {
     }
 
     fn trigger_gc_if_needed(&self) {
+        if self.config.auto_purge_after_secs.is_some() {
+            let interval = self.config.auto_purge_check_interval_secs;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let should_run = if interval == 0 {
+                self.last_purge_check.store(now_secs, Ordering::Relaxed);
+                true
+            } else {
+                let last = self.last_purge_check.load(Ordering::Relaxed);
+                if now_secs.saturating_sub(last) < interval {
+                    false
+                } else {
+                    self.last_purge_check
+                        .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                }
+            };
+
+            if should_run {
+                match self.purge_expired_entries() {
+                    Ok(purged) if purged > 0 => {
+                        debug!("自动清理过期条目: {} 个", purged);
+                    }
+                    Err(err) => {
+                        warn!("自动清理过期条目失败: {}", err);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let lazy_count = self.lazy_deleted_entries.len();
         let live_count = self.index.len().max(1);
 
@@ -2082,6 +2129,104 @@ impl HighPerfMmapStorage {
         if lazy_count > (live_count / 2) || lazy_bytes >= self.config.growth_step {
             let _ = self.garbage_collect();
         }
+    }
+
+    /// 根据配置的过期时间，自动将旧数据标记为惰性删除
+    fn purge_expired_entries(&self) -> std::io::Result<usize> {
+        let ttl = match self.config.auto_purge_after_secs {
+            Some(ttl) if ttl > 0 => ttl,
+            _ => return Ok(0),
+        };
+
+        if self.active_writers.load(Ordering::Relaxed) > 0 {
+            return Ok(0);
+        }
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .as_secs();
+
+        if now_secs <= ttl {
+            return Ok(0);
+        }
+        let cutoff = now_secs - ttl;
+
+        let mmap = match self.load_mmap_ro_with_retry(Self::MMAP_RETRY_ATTEMPTS) {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let len = mmap.len();
+
+        let mut expired: Vec<(u64, String)> = Vec::new();
+        {
+            let ord = self.ordered_index.read();
+            for (offset, key) in ord.iter() {
+                let start = *offset as usize;
+                let end_header = start.saturating_add(HEADER_SIZE);
+                if end_header > len {
+                    continue;
+                }
+                let ts_start = start + HDR_OFF_TIMESTAMP.start;
+                let ts_end = start + HDR_OFF_TIMESTAMP.end;
+                if ts_end > len {
+                    continue;
+                }
+                let mut ts_bytes = [0u8; 8];
+                ts_bytes.copy_from_slice(&mmap[ts_start..ts_end]);
+                let ts = u64::from_le_bytes(ts_bytes);
+                if ts == 0 {
+                    continue;
+                }
+
+                if ts <= cutoff {
+                    expired.push((*offset, key.clone()));
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let mut removed = 0usize;
+        for (offset, key) in expired {
+            match self.index.entry(key.clone()) {
+                Entry::Occupied(mut occ) => {
+                    let (stored_offset, size) = *occ.get();
+                    if stored_offset != offset {
+                        continue;
+                    }
+                    let (_, (_removed_offset, value_size)) = occ.remove_entry();
+
+                    self.lazy_deleted_entries
+                        .insert(offset, (key.clone(), value_size));
+                    {
+                        let mut by_end = self.lazy_by_end.write();
+                        by_end.insert(offset + value_size, (key.clone(), (offset, value_size)));
+                    }
+                    {
+                        let mut ord = self.ordered_index.write();
+                        ord.remove(&offset);
+                    }
+                    if let Some((_k, v)) = self.hot_cache.remove(&key) {
+                        self.hot_cache_bytes.fetch_sub(v.size, Ordering::Relaxed);
+                    }
+
+                    self.stats.total_deletes.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .lazy_deleted_entries
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    removed += 1;
+                }
+                Entry::Vacant(_) => continue,
+            }
+        }
+
+        Ok(removed)
     }
 
     /// 紧凑数据文件，移除已被删除的数据，回收磁盘空间
@@ -2308,6 +2453,8 @@ impl HighPerfMmapStorage {
             compression: self.config.compression.clone(),
             growth_step: self.config.initial_file_size,
             max_file_size:self.config.initial_file_size,
+            auto_purge_after_secs: self.config.auto_purge_after_secs,
+            auto_purge_check_interval_secs: self.config.auto_purge_check_interval_secs,
         }
     }
 
@@ -2498,6 +2645,28 @@ impl HighPerfMmapStorage {
             );
         }
 
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let purge_interval = config.auto_purge_check_interval_secs;
+        let initial_purge_check = if purge_interval > 0 {
+            now_secs.saturating_sub(purge_interval)
+        } else {
+            now_secs
+        };
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let purge_interval = config.auto_purge_check_interval_secs;
+        let initial_purge_check = if purge_interval > 0 {
+            now_secs.saturating_sub(purge_interval)
+        } else {
+            now_secs
+        };
+
         let storage = Self {
             disk_dir,
             data_file_path,
@@ -2521,12 +2690,9 @@ impl HighPerfMmapStorage {
             lazy_by_end: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             ordered_index: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             next_gc_time: Arc::new(AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + 60,
+                now_secs + 60,
             )),
+            last_purge_check: Arc::new(AtomicU64::new(initial_purge_check)),
             shutdown: Arc::new(AtomicBool::new(false)),
             prefetch_thread: Mutex::new(None),
             memory_limit,
@@ -2565,6 +2731,17 @@ impl HighPerfMmapStorage {
         memory_limit: MemoryLimitConfig,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&disk_dir)?;
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let purge_interval = config.auto_purge_check_interval_secs;
+        let initial_purge_check = if purge_interval > 0 {
+            now_secs.saturating_sub(purge_interval)
+        } else {
+            now_secs
+        };
 
         let data_file_path = disk_dir.join("data.bin");
         let index_file_path = disk_dir.join("index.bin");
@@ -2608,12 +2785,9 @@ impl HighPerfMmapStorage {
             lazy_by_end: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             ordered_index: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             next_gc_time: Arc::new(AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + 60,
+                now_secs + 60,
             )),
+            last_purge_check: Arc::new(AtomicU64::new(initial_purge_check)),
             shutdown: Arc::new(AtomicBool::new(false)),
             prefetch_thread: Mutex::new(None),
             memory_limit,

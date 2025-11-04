@@ -65,6 +65,8 @@ fn default_config() -> HighPerfMmapConfig {
         memory_pressure_threshold: 0.8,
         cache_degradation_threshold: 0.9,
         compression: Default::default(),
+        auto_purge_after_secs: None,
+        auto_purge_check_interval_secs: 300,
     }
 }
 

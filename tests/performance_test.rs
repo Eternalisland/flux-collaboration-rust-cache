@@ -20,6 +20,8 @@ mod common {
         pub prefetch_queue_size: usize,
         pub memory_pressure_threshold: f64,
         pub cache_degradation_threshold: f64,
+        pub auto_purge_after_secs: Option<u64>,
+        pub auto_purge_check_interval_secs: u64,
     }
     
     impl Default for TestHighPerfMmapConfig {
@@ -37,6 +39,8 @@ mod common {
                 prefetch_queue_size: 100,               // 100 个预读任务
                 memory_pressure_threshold: 0.8,         // 80% 内存使用率触发降级
                 cache_degradation_threshold: 0.9,       // 90% 内存使用率强制降级
+                auto_purge_after_secs: None,
+                auto_purge_check_interval_secs: 300,
             }
         }
     }

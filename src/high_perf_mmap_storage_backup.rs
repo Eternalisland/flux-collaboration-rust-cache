@@ -318,6 +318,7 @@ impl Default for AtomicStats {
 pub struct HighPerfMmapStats {
     pub total_writes: u64,
     pub total_reads: u64,
+    pub total_records: u64,
     pub total_write_bytes: u64,
     pub total_read_bytes: u64,
     pub l1_cache_hits: u64,
@@ -1995,6 +1996,7 @@ impl HighPerfMmapStorage {
         HighPerfMmapStats {
             total_writes: self.stats.total_writes.load(Ordering::Relaxed),
             total_reads: self.stats.total_reads.load(Ordering::Relaxed),
+            total_records: self.index.len() as u64,
             total_write_bytes: self.stats.total_write_bytes.load(Ordering::Relaxed),
             total_read_bytes: self.stats.total_read_bytes.load(Ordering::Relaxed),
             l1_cache_hits: self.stats.l1_cache_hits.load(Ordering::Relaxed),

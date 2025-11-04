@@ -566,6 +566,7 @@ function normalizeStats(payload: Record<string, unknown>): HighPerfMmapStats {
   return {
     totalWrites: numberish(payload.totalWrites ?? payload['total_writes']),
     totalReads: numberish(payload.totalReads ?? payload['total_reads']),
+    totalRecords: numberish(payload.totalRecords ?? payload['total_records']),
     totalDeletes: numberish(payload.totalDeletes ?? payload['total_deletes']),
     totalWriteBytes: numberish(
       payload.totalWriteBytes ?? payload['total_write_bytes']

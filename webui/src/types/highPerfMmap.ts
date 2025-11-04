@@ -48,6 +48,7 @@ export interface MemoryStats {
 export interface HighPerfMmapStats {
   totalWrites: number;
   totalReads: number;
+  totalRecords: number;
   totalDeletes: number;
   totalWriteBytes: number;
   totalReadBytes: number;

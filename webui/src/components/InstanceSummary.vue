@@ -2,6 +2,10 @@
   <div class="instance-summary">
     <div class="kpi-row">
       <div class="kpi-card">
+        <div class="kpi-label">总记录数</div>
+        <div class="kpi-value">{{ stats.totalRecords.toLocaleString() }}</div>
+      </div>
+      <div class="kpi-card">
         <div class="kpi-label">写入次数</div>
         <div class="kpi-value">{{ stats.totalWrites.toLocaleString() }}</div>
       </div>

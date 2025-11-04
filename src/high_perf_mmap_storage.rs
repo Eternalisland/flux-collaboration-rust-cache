@@ -403,6 +403,8 @@ pub struct HighPerfMmapStats {
     pub total_writes: u64,
     pub total_reads: u64,
     pub total_deletes: u64,
+    // 当前索引条目数（活跃记录总数）
+    pub total_records: u64,
     pub total_write_bytes: u64,
     pub total_read_bytes: u64,
     pub l1_cache_hits: u64,
@@ -2245,6 +2247,8 @@ impl HighPerfMmapStorage {
             total_reads: self.stats.total_reads.load(Ordering::Relaxed),
             // 删除操作总次数
             total_deletes: self.stats.total_deletes.load(Ordering::Relaxed),
+            // 当前索引条目数（活跃记录总数）
+            total_records: self.index.len() as u64,
             // 写入总字节数（原始数据大小）
             total_write_bytes: self.stats.total_write_bytes.load(Ordering::Relaxed),
             // 读取总字节数（解压后数据大小）

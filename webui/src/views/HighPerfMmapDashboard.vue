@@ -3,16 +3,17 @@
     <section class="dashboard-toolbar">
       <div class="toolbar-left">
         <n-space :size="12" align="center">
-          <n-button type="primary" :loading="loading" @click="loadInstances">
+          <n-button type="primary" :loading="loading" @click="loadInstances" size="small">
             刷新数据
           </n-button>
-          <n-button quaternary @click="toggleMock">
-            {{ useFallback ? '关闭示例数据' : '使用示例数据' }}
-          </n-button>
+<!--          <n-button quaternary @click="toggleMock">-->
+<!--            {{ useFallback ? '关闭示例数据' : '使用示例数据' }}-->
+<!--          </n-button>-->
           <n-input
             v-model:value="filterText"
-            style="min-width: 200px"
+            style="min-width: 380px"
             clearable
+            size="small"
             placeholder="按名称或 ID 过滤实例"
           />
         </n-space>
@@ -62,7 +63,18 @@
                   <n-tag type="info">
                     文件上限：{{ formatBytes(instance.config.maxFileSize) }}
                   </n-tag>
-                  <n-button text size="small" @click="toggleExpand(instance.id)">
+                  <n-button type="primary" size="small" @click="toggleExpand(instance.id)">
+
+                    <template #icon v-if="isExpanded(instance.id)">
+                      <NIcon>
+                        <ArrowUpCircleOutline />
+                      </NIcon>
+                    </template>
+                    <template #icon v-else>
+                      <NIcon>
+                        <ArrowDownCircleOutline />
+                      </NIcon>
+                    </template>
                     {{ isExpanded(instance.id) ? '收起详情' : '展开详情' }}
                   </n-button>
                 </n-space>
@@ -137,7 +149,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue';
+import {  onMounted, onBeforeUnmount, computed, reactive, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -158,7 +170,9 @@ import {
   ConstructOutline,
   HardwareChipOutline,
   AnalyticsOutline,
-  ServerOutline
+  ServerOutline,
+  ArrowUpCircleOutline,
+  ArrowDownCircleOutline
 } from '@vicons/ionicons5';
 import InstanceSummary from '../components/InstanceSummary.vue';
 import ConfigSection from '../components/ConfigSection.vue';
@@ -197,9 +211,10 @@ const instances = ref<InstanceViewModel[]>([]);
 const loading = ref(false);
 const lastFetched = ref<Date | null>(null);
 const error = ref<string | null>(null);
-const useFallback = ref(true);
+const useFallback = ref(false);
 const filterText = ref('');
 const expanded = reactive(new Set<string>());
+let timerHandle: any = null
 
 const fallbackData: InstanceViewModel[] = reactive([
   {
@@ -346,32 +361,45 @@ const fallbackData: InstanceViewModel[] = reactive([
   }
 ]);
 
+
+onMounted(() => {
+  loadInstances()
+
+  timerHandle = setInterval(
+      async () => {
+        await loadInstances();
+      },
+      10000,
+  ) // 使用类型断言
+})
+onBeforeUnmount(() => {
+  if (timerHandle) clearInterval(timerHandle)
+})
+
+import { fetchDatahubRustJniStatus } from '../api/api'
 async function loadInstances() {
-  if (useFallback.value) {
-    error.value = null;
-    instances.value = [...fallbackData];
-    lastFetched.value = new Date();
-    expanded.clear();
-    return;
-  }
+  // if (useFallback.value) {
+  //   error.value = null;
+  //   instances.value = [...fallbackData];
+  //   lastFetched.value = new Date();
+  //   expanded.clear();
+  //   return;
+  // }
 
   loading.value = true;
   error.value = null;
   try {
-    const response = await fetch('/api/high-perf-mmap/instances');
-    if (!response.ok) {
-      throw new Error(`后端返回错误状态：${response.status}`);
-    }
-    const data = (await response.json()) as RawInstancePayload[];
+    const snapshot = await fetchDatahubRustJniStatus();
+    const data = ( snapshot ) as RawInstancePayload[];
     instances.value = data.map(normalizeInstance);
     lastFetched.value = new Date();
-    expanded.clear();
+    // expanded.clear();
   } catch (err) {
     console.error(err);
     error.value =
       err instanceof Error ? err.message : '拉取实例信息失败，已切换至示例数据。';
-    instances.value = [...fallbackData];
-    useFallback.value = true;
+    // instances.value = [...fallbackData];
+    // useFallback.value = true;
     lastFetched.value = new Date();
   } finally {
     loading.value = false;
@@ -583,8 +611,6 @@ function normalizeStats(payload: Record<string, unknown>): HighPerfMmapStats {
     )
   };
 }
-
-loadInstances();
 
 const icons = {
   summary: SpeedometerOutline,

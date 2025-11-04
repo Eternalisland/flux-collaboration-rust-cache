@@ -429,6 +429,7 @@ pub struct HighPerfMmapStats {
 pub struct HighPerfMmapStatus {
     pub stats: HighPerfMmapStats,
     pub memory: MemoryStats,
+    pub config: HighPerfMmapConfig ,
 }
 
 // #[derive(Debug, Clone)]
@@ -448,7 +449,6 @@ pub struct HighPerfMmapConfig {
     pub prefetch_queue_size: usize,
     pub memory_pressure_threshold: f64,
     pub cache_degradation_threshold: f64,
-
     /// 新增：详细的压缩配置
     pub compression: CompressionConfig,
 }
@@ -2288,10 +2288,30 @@ impl HighPerfMmapStorage {
         }
     }
 
+    pub fn get_confgig(&self) -> HighPerfMmapConfig {
+        HighPerfMmapConfig {
+            initial_file_size: self.config.initial_file_size,
+            enable_compression: self.config.enable_compression,
+            l1_cache_size_limit: self.config.l1_cache_size_limit,
+            l1_cache_entry_limit: self.config.l1_cache_entry_limit,
+            l2_cache_size_limit: self.config.l2_cache_size_limit,
+            l2_cache_entry_limit: self.config.l2_cache_entry_limit,
+            enable_prefetch:self.config.enable_prefetch,
+            prefetch_queue_size:self.config.prefetch_queue_size,
+            memory_pressure_threshold:self.config.memory_pressure_threshold,
+            cache_degradation_threshold: self.config.cache_degradation_threshold,
+            growth_reserve_steps: self.config.growth_reserve_steps,
+            compression: self.config.compression.clone(),
+            growth_step: self.config.initial_file_size,
+            max_file_size:self.config.initial_file_size,
+        }
+    }
+
     pub fn get_status(&self) -> HighPerfMmapStatus {
         HighPerfMmapStatus {
             stats: self.get_stats(),
             memory: self.get_memory_stats(),
+            config : self.get_confgig()
         }
     }
 

@@ -8,15 +8,15 @@
               <IconStatsChartOutline />
             </n-icon>
             <div class="title-text">
-              <h1>High Performance MMAP Dashboard</h1>
-              <p>实时洞察多实例配置、压缩策略与读写行为</p>
+              <h1>Datahub Rust Jni Stats Dashboard</h1>
+              <p>查看 datahub Rust Jni 运行时状态</p>
             </div>
           </div>
-          <div class="header-actions">
-            <n-button quaternary type="primary" @click="toggleTheme">
-              {{ isDark ? 'Light Mode' : 'Dark Mode' }}
-            </n-button>
-          </div>
+<!--          <div class="header-actions">-->
+<!--            <n-button quaternary type="primary" @click="toggleTheme">-->
+<!--              {{ isDark ? 'Light Mode' : 'Dark Mode' }}-->
+<!--            </n-button>-->
+<!--          </div>-->
         </header>
         <main class="app-content">
           <HighPerfMmapDashboard />

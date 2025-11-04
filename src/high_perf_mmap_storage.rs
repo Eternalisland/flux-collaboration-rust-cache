@@ -320,8 +320,6 @@ pub struct HighPerfMmapStorage {
     last_memory_check: Arc<AtomicU64>,
 
     memory_limit: MemoryLimitConfig,
-    /// 内存监控后台线程句柄
-    memory_monitor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// 【关键改造4】原子化的统计结构
@@ -464,15 +462,15 @@ pub struct HighPerfMmapConfig {
 impl Default for HighPerfMmapConfig {
     fn default() -> Self {
         Self {
-            initial_file_size: 100 * 1024 * 1024,
+            initial_file_size: 1024 * 1024 * 1024,
             growth_step: 50 * 1024 * 1024,
             growth_reserve_steps: 3,
             max_file_size: 10 * 1024 * 1024 * 1024,
             enable_compression: false,
-            l1_cache_size_limit: 50 * 1024 * 1024,
+            l1_cache_size_limit: 200 * 1024 * 1024,
             l1_cache_entry_limit: 500,
-            l2_cache_size_limit: 200 * 1024 * 1024,
-            l2_cache_entry_limit: 2000,
+            l2_cache_size_limit: 300 * 1024 * 1024,
+            l2_cache_entry_limit: 1000,
             enable_prefetch: true,
             prefetch_queue_size: 100,
             memory_pressure_threshold: 0.8,
@@ -2698,7 +2696,6 @@ impl HighPerfMmapStorage {
             memory_limit,
             cache_evictions: Arc::new(AtomicU64::new(0)),
             forced_evictions: Arc::new(AtomicU64::new(0)),
-            memory_monitor_thread: Mutex::new(None),
             last_memory_check: Arc::new(AtomicU64::new(0)),
         };
 
@@ -2793,7 +2790,6 @@ impl HighPerfMmapStorage {
             memory_limit,
             cache_evictions: Arc::new(AtomicU64::new(0)),
             forced_evictions: Arc::new(AtomicU64::new(0)),
-            memory_monitor_thread: Mutex::new(None),
             last_memory_check: Arc::new(AtomicU64::new(0)),
         };
 
@@ -3097,9 +3093,6 @@ impl Drop for HighPerfMmapStorage {
             let _ = h.join();
         }
 
-        if let Some(h) = self.memory_monitor_thread.get_mut().take() {
-            let _ = h.join();
-        }
 
         // 输出最终内存统计
         let mem_stats = self.get_memory_stats();

@@ -63,7 +63,7 @@ fn parse_args() -> Args {
     let mut dir = PathBuf::from("./benchdata");
     let mut writers = 2usize;
     let mut readers = 4usize;
-    let mut secs = 60u64;
+    let mut secs = 120u64;
     let mut keyspace = 100_000u64;
     let mut vmean = 1024usize;
     let mut vmax = 4096usize;
@@ -192,7 +192,7 @@ fn main() -> std::io::Result<()> {
         let vmax = args.vmax;
         let mut ts = ThreadStats::default();
         let h = thread::spawn(move || {
-            let mut rng = StdRng::from_entropy();
+            let mut rng = StdRng::from_os_rng();
             while running.load(Ordering::Relaxed) {
                 let id = next_id.fetch_add(1, Ordering::Relaxed) %  args.keyspace;
                 let key = format!("k_{}", id);
@@ -223,7 +223,7 @@ fn main() -> std::io::Result<()> {
         let batch_n = args.batch;
         let mut ts = ThreadStats::default();
         let h = thread::spawn(move || {
-            let mut rng = StdRng::from_entropy();
+            let mut rng = StdRng::from_os_rng();
             while running.load(Ordering::Relaxed) {
                 let dice: u8 = rng.gen_range(0..100);
                 if dice < 80 { // read 单读

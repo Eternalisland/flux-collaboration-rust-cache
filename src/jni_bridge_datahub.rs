@@ -148,32 +148,40 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     #[derive(Debug, Deserialize)]
     struct IncomingConfig {
         disk_dir: String,
-        #[serde(default)] clear_on_start: bool,
-        #[serde(default)] config: Option<HighPerfMmapConfig>,
-        #[serde(default)] memory_limit: Option<MemoryLimitConfig>,
-        #[serde(default)] compression: Option<crate::high_perf_mmap_storage::CompressionConfig>,
+        #[serde(default)] 
+        clear_on_start: bool,
+        #[serde(default)] 
+        config: Option<HighPerfMmapConfig>,
+        #[serde(default)] 
+        memory_limit: Option<MemoryLimitConfig>,
+        #[serde(default)] 
+        compression: Option<crate::high_perf_mmap_storage::CompressionConfig>,
+        // #[serde(default)] clear_on_start: bool,
+        // #[serde(default)] config: Option<HighPerfMmapConfig>,
+        // #[serde(default)] memory_limit: Option<MemoryLimitConfig>,
+        // #[serde(default)] compression: Option<crate::high_perf_mmap_storage::CompressionConfig>,
 
-        #[serde(default)] initial_file_size: Option<u64>,
-        #[serde(default)] growth_step: Option<u64>,
-        #[serde(default)] growth_reserve_steps: Option<u32>,
-        #[serde(default)] max_file_size: Option<u64>,
-        #[serde(default)] enable_compression: Option<bool>,
-        #[serde(default)] l1_cache_size_limit: Option<u64>,
-        #[serde(default)] l1_cache_entry_limit: Option<usize>,
-        #[serde(default)] l2_cache_size_limit: Option<u64>,
-        #[serde(default)] l2_cache_entry_limit: Option<usize>,
-        #[serde(default)] enable_prefetch: Option<bool>,
-        #[serde(default)] prefetch_queue_size: Option<usize>,
-        #[serde(default)] memory_pressure_threshold: Option<f64>,
-        #[serde(default)] cache_degradation_threshold: Option<f64>,
+        // #[serde(default)] initial_file_size: Option<u64>,
+        // #[serde(default)] growth_step: Option<u64>,
+        // #[serde(default)] growth_reserve_steps: Option<u32>,
+        // #[serde(default)] max_file_size: Option<u64>,
+        // #[serde(default)] enable_compression: Option<bool>,
+        // #[serde(default)] l1_cache_size_limit: Option<u64>,
+        // #[serde(default)] l1_cache_entry_limit: Option<usize>,
+        // #[serde(default)] l2_cache_size_limit: Option<u64>,
+        // #[serde(default)] l2_cache_entry_limit: Option<usize>,
+        // #[serde(default)] enable_prefetch: Option<bool>,
+        // #[serde(default)] prefetch_queue_size: Option<usize>,
+        // #[serde(default)] memory_pressure_threshold: Option<f64>,
+        // #[serde(default)] cache_degradation_threshold: Option<f64>,
 
-        #[serde(default)] heap_soft_limit: Option<u64>,
-        #[serde(default)] heap_hard_limit: Option<u64>,
-        #[serde(default)] l1_cache_hard_limit: Option<u64>,
-        #[serde(default)] l1_cache_entry_hard_limit: Option<usize>,
-        #[serde(default)] max_eviction_percent: Option<f64>,
-        #[serde(default)] reject_writes_under_pressure: Option<bool>,
-        #[serde(default)] check_interval_ms: Option<u64>,
+        // #[serde(default)] heap_soft_limit: Option<u64>,
+        // #[serde(default)] heap_hard_limit: Option<u64>,
+        // #[serde(default)] l1_cache_hard_limit: Option<u64>,
+        // #[serde(default)] l1_cache_entry_hard_limit: Option<usize>,
+        // #[serde(default)] max_eviction_percent: Option<f64>,
+        // #[serde(default)] reject_writes_under_pressure: Option<bool>,
+        // #[serde(default)] check_interval_ms: Option<u64>,
     }
 
     let result = (|| -> ResultBox<jlong> {
@@ -184,31 +192,39 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         // 目录
         let disk_path = PathBuf::from(&incoming.disk_dir);
 
-        let mut cfg = incoming.config.unwrap_or_default();
-        if let Some(v) = incoming.initial_file_size { cfg.initial_file_size = v; }
-        if let Some(v) = incoming.growth_step { cfg.growth_step = v; }
-        if let Some(v) = incoming.growth_reserve_steps { cfg.growth_reserve_steps = v; }
-        if let Some(v) = incoming.max_file_size { cfg.max_file_size = v; }
-        if let Some(v) = incoming.enable_compression { cfg.enable_compression = v; }
-        if let Some(v) = incoming.l1_cache_size_limit { cfg.l1_cache_size_limit = v; }
-        if let Some(v) = incoming.l1_cache_entry_limit { cfg.l1_cache_entry_limit = v; }
-        if let Some(v) = incoming.l2_cache_size_limit { cfg.l2_cache_size_limit = v; }
-        if let Some(v) = incoming.l2_cache_entry_limit { cfg.l2_cache_entry_limit = v; }
-        if let Some(v) = incoming.enable_prefetch { cfg.enable_prefetch = v; }
-        if let Some(v) = incoming.prefetch_queue_size { cfg.prefetch_queue_size = v; }
-        if let Some(v) = incoming.memory_pressure_threshold { cfg.memory_pressure_threshold = v; }
-        if let Some(v) = incoming.cache_degradation_threshold { cfg.cache_degradation_threshold = v; }
-        if let Some(v) = incoming.compression { cfg.compression = v; }
+        // let mut cfg = incoming.config.unwrap_or_default();
+        // if let Some(v) = incoming.initial_file_size { cfg.initial_file_size = v; }
+        // if let Some(v) = incoming.growth_step { cfg.growth_step = v; }
+        // if let Some(v) = incoming.growth_reserve_steps { cfg.growth_reserve_steps = v; }
+        // if let Some(v) = incoming.max_file_size { cfg.max_file_size = v; }
+        // if let Some(v) = incoming.enable_compression { cfg.enable_compression = v; }
+        // if let Some(v) = incoming.l1_cache_size_limit { cfg.l1_cache_size_limit = v; }
+        // if let Some(v) = incoming.l1_cache_entry_limit { cfg.l1_cache_entry_limit = v; }
+        // if let Some(v) = incoming.l2_cache_size_limit { cfg.l2_cache_size_limit = v; }
+        // if let Some(v) = incoming.l2_cache_entry_limit { cfg.l2_cache_entry_limit = v; }
+        // if let Some(v) = incoming.enable_prefetch { cfg.enable_prefetch = v; }
+        // if let Some(v) = incoming.prefetch_queue_size { cfg.prefetch_queue_size = v; }
+        // if let Some(v) = incoming.memory_pressure_threshold { cfg.memory_pressure_threshold = v; }
+        // if let Some(v) = incoming.cache_degradation_threshold { cfg.cache_degradation_threshold = v; }
+        // if let Some(v) = incoming.compression { cfg.compression = v; }
 
-        let mut memory = incoming.memory_limit.unwrap_or_default();
-        if let Some(v) = incoming.heap_soft_limit { memory.heap_soft_limit = v; }
-        if let Some(v) = incoming.heap_hard_limit { memory.heap_hard_limit = v; }
-        if let Some(v) = incoming.l1_cache_hard_limit { memory.l1_cache_hard_limit = v; }
-        if let Some(v) = incoming.l1_cache_entry_hard_limit { memory.l1_cache_entry_hard_limit = v; }
-        if let Some(v) = incoming.max_eviction_percent { memory.max_eviction_percent = v; }
-        if let Some(v) = incoming.reject_writes_under_pressure { memory.reject_writes_under_pressure = v; }
-        if let Some(v) = incoming.check_interval_ms { memory.check_interval_ms = v; }
+        // let mut memory = incoming.memory_limit.unwrap_or_default();
+        // if let Some(v) = incoming.heap_soft_limit { memory.heap_soft_limit = v; }
+        // if let Some(v) = incoming.heap_hard_limit { memory.heap_hard_limit = v; }
+        // if let Some(v) = incoming.l1_cache_hard_limit { memory.l1_cache_hard_limit = v; }
+        // if let Some(v) = incoming.l1_cache_entry_hard_limit { memory.l1_cache_entry_hard_limit = v; }
+        // if let Some(v) = incoming.max_eviction_percent { memory.max_eviction_percent = v; }
+        // if let Some(v) = incoming.reject_writes_under_pressure { memory.reject_writes_under_pressure = v; }
+        // if let Some(v) = incoming.check_interval_ms { memory.check_interval_ms = v; }
 
+         let mut cfg = incoming.config.unwrap_or_default();
+        // 如果存在顶层的 compression 配置，覆盖 config 中的 compression
+        if let Some(compression_config) = incoming.compression {
+            cfg.compression = compression_config;
+        }
+
+        // 使用嵌套的 memory_limit 对象，如果不存在则使用默认值
+        let memory = incoming.memory_limit.unwrap_or_default();
         create_storage_handle(disk_path, cfg, memory, incoming.clear_on_start)
     })();
 

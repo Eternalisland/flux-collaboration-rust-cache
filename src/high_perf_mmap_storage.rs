@@ -571,27 +571,27 @@ impl<'a> Drop for WriterGuard<'a> {
     }
 }
 
-// ========== 核心修复1：读取时增加引用计数 ==========
+// ========== 读取时增加引用计数 ==========
 
 /// 【RAII守卫】自动管理读者计数
-struct ReaderGuard {
-    counter: Arc<AtomicU64>,
-}
+// struct ReaderGuard {
+//     counter: Arc<AtomicU64>,
+// }
+//
+// impl ReaderGuard {
+//     #[inline]
+//     fn new(counter: Arc<AtomicU64>) -> Self {
+//         counter.fetch_add(1, Ordering::Acquire);
+//         Self { counter }
+//     }
+// }
 
-impl ReaderGuard {
-    #[inline]
-    fn new(counter: Arc<AtomicU64>) -> Self {
-        counter.fetch_add(1, Ordering::Acquire);
-        Self { counter }
-    }
-}
-
-impl Drop for ReaderGuard {
-    #[inline]
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
-    }
-}
+// impl Drop for ReaderGuard {
+//     #[inline]
+//     fn drop(&mut self) {
+//         self.counter.fetch_sub(1, Ordering::Release);
+//     }
+// }
 
 impl HighPerfMmapStorage {
     /// Maximum attempts when trying to grab an mmap snapshot while a remap is in flight.
@@ -908,40 +908,30 @@ impl HighPerfMmapStorage {
         // use lz4_flex::compress_prepend_size;
         // Ok(compress_prepend_size(data))
 
-        // 这里提供伪代码框架
-        // 实际使用时取消下面注释并添加依赖
-        /*
         use lz4_flex::compress_prepend_size;
         Ok(compress_prepend_size(data))
-        */
 
         // 占位实现（实际需要真实的压缩库）
-        Ok(data.to_vec())
+        // Ok(data.to_vec())
     }
 
     /// Zstd 压缩（推荐：可调节压缩级别）
     fn compress_zstd(&self, data: &[u8]) -> io::Result<Vec<u8>> {
         // 实际实现需要 zstd crate
-        /*
-        use zstd::bulk::compress;
-        compress(data, self.config.compression.compression_level)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        */
 
-        Ok(data.to_vec())
+        use zstd::bulk::compress;
+        Ok(compress(data, self.config.compression.compression_level)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e)).unwrap().to_vec())
     }
 
     /// Snappy 压缩
     fn compress_snappy(&self, data: &[u8]) -> io::Result<Vec<u8>> {
         // 实际实现需要 snap crate
-        /*
+
         use snap::raw::Encoder;
         let mut encoder = Encoder::new();
-        encoder.compress_vec(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        */
-
-        Ok(data.to_vec())
+        Ok(encoder.compress_vec(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e)).unwrap().to_vec())
     }
 
     /// 【解压缩】根据算法类型解压
@@ -959,31 +949,28 @@ impl HighPerfMmapStorage {
     }
 
     fn decompress_lz4(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        /*
+
         use lz4_flex::decompress_size_prepended;
-        decompress_size_prepended(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        */
-        Ok(data.to_vec())
+        Ok(decompress_size_prepended(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?.to_vec())
+        // data.to_vec())
     }
 
     fn decompress_zstd(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        /*
+
         use zstd::bulk::decompress;
-        decompress(data, self.config.l1_cache_size_limit as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        */
-        Ok(data.to_vec())
+        Ok(decompress(data, self.config.l1_cache_size_limit as usize)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?.to_vec())
+        // Ok(data.to_vec())
     }
 
     fn decompress_snappy(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        /*
+
         use snap::raw::Decoder;
         let mut decoder = Decoder::new();
-        decoder.decompress_vec(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        */
-        Ok(data.to_vec())
+        Ok(decoder.decompress_vec(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?.to_vec())
+        // Ok(data.to_vec())
     }
 
     /// 【无锁优化】读取 mmap 的核心方法：完全无锁
@@ -1013,80 +1000,81 @@ impl HighPerfMmapStorage {
     // }
     // }
 
-    fn write_data_at_offset_once(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        let mut mmap_guard = self.mmap_rw.write();
+    // fn write_data_at_offset_once(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    //     let mut mmap_guard = self.mmap_rw.write();
+    //
+    //     if let Some(mmap) = mmap_guard.as_mut() {
+    //         let len = mmap.len();
+    //         let header_size = HEADER_SIZE;
+    //
+    //         if offset as usize > len {
+    //             return Err(std::io::Error::new(
+    //                 std::io::ErrorKind::UnexpectedEof,
+    //                 "write offset out of bounds",
+    //             ));
+    //         }
+    //
+    //         let start = offset as usize;
+    //         let end_header = start.saturating_add(header_size);
+    //         if end_header > len {
+    //             self.record_error("write_header_oob");
+    //             return Err(std::io::Error::new(
+    //                 std::io::ErrorKind::UnexpectedEof,
+    //                 "header out of bounds",
+    //             ));
+    //         }
+    //
+    //         let data_end = end_header.saturating_add(data.len());
+    //         if data_end > len {
+    //             return Err(std::io::Error::new(
+    //                 std::io::ErrorKind::UnexpectedEof,
+    //                 "data out of bounds",
+    //             ));
+    //         }
+    //
+    //         let now_ts = std::time::SystemTime::now()
+    //             .duration_since(std::time::UNIX_EPOCH)
+    //             .unwrap()
+    //             .as_secs();
+    //
+    //         let mut header_bytes = [0u8; HEADER_SIZE];
+    //         header_bytes[HDR_OFF_DATA_SIZE].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    //         header_bytes[HDR_OFF_COMPRESSED] = 0;
+    //         header_bytes[HDR_OFF_COMMIT] = 0;
+    //         header_bytes[HDR_OFF_TIMESTAMP].copy_from_slice(&now_ts.to_le_bytes());
+    //
+    //         mmap[start..end_header].copy_from_slice(&header_bytes);
+    //         mmap[end_header..data_end].copy_from_slice(data);
+    //         std::sync::atomic::fence(Ordering::Release);
+    //         mmap[start + HDR_OFF_COMMIT] = 1;
+    //
+    //         Ok(())
+    //     } else {
+    //         return Err(Error::new(ErrorKind::WouldBlock, "mmap_rw not initialized"));
+    //     }
+    // }
 
-        if let Some(mmap) = mmap_guard.as_mut() {
-            let len = mmap.len();
-            let header_size = HEADER_SIZE;
-
-            if offset as usize > len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "write offset out of bounds",
-                ));
-            }
-
-            let start = offset as usize;
-            let end_header = start.saturating_add(header_size);
-            if end_header > len {
-                self.record_error("write_header_oob");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "header out of bounds",
-                ));
-            }
-
-            let data_end = end_header.saturating_add(data.len());
-            if data_end > len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "data out of bounds",
-                ));
-            }
-
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            let mut header_bytes = [0u8; HEADER_SIZE];
-            header_bytes[HDR_OFF_DATA_SIZE].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            header_bytes[HDR_OFF_COMPRESSED] = 0;
-            header_bytes[HDR_OFF_COMMIT] = 0;
-            header_bytes[HDR_OFF_TIMESTAMP].copy_from_slice(&now_ts.to_le_bytes());
-
-            mmap[start..end_header].copy_from_slice(&header_bytes);
-            mmap[end_header..data_end].copy_from_slice(data);
-            mmap[start + HDR_OFF_COMMIT] = 1;
-
-            Ok(())
-        } else {
-            return Err(Error::new(ErrorKind::WouldBlock, "mmap_rw not initialized"));
-        }
-    }
-
-    fn write_data_at_offset_retry(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        for attempt in 0..=2 {
-            {
-                let _ml = self.map_lock.read();
-                if let Ok(()) = self.write_data_at_offset_once(offset, data) {
-                    return Ok(());
-                }
-            }
-
-            if attempt < 2 {
-                let _ = self.remap_mmap();
-                std::thread::yield_now();
-                continue;
-            }
-            break;
-        }
-        Err(std::io::Error::new(
-            ErrorKind::Other,
-            "write failed after retry",
-        ))
-    }
+    // fn write_data_at_offset_retry(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    //     for attempt in 0..=2 {
+    //         {
+    //             let _ml = self.map_lock.read();
+    //             if let Ok(()) = self.write_data_at_offset_once(offset, data) {
+    //                 return Ok(());
+    //             }
+    //         }
+    //
+    //         if attempt < 2 {
+    //             let _ = self.remap_mmap();
+    //             std::thread::yield_now();
+    //             continue;
+    //         }
+    //         break;
+    //     }
+    //     Err(std::io::Error::new(
+    //         ErrorKind::Other,
+    //         "write failed after retry",
+    //     ))
+    // }
 
     fn remap_mmap_locked(&self) -> std::io::Result<()> {
         // 【关键】只需 map_lock 保护文件操作
@@ -1645,10 +1633,7 @@ impl HighPerfMmapStorage {
         if self.memory_limit.reject_writes_under_pressure {
             let pressure = self.get_memory_pressure_level();
             if pressure >= 3 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "内存压力过高，拒绝写入",
-                ));
+                warn!("内存压力达到级别 {}，仍然执行写入以保证持久化", pressure);
             }
         }
 
@@ -1753,40 +1738,57 @@ impl HighPerfMmapStorage {
         let path_ns = start_path.elapsed().as_nanos() as u64;
         let path_us = (path_ns + 999) / 1000;
 
-        // 【关键修复】写入成功后，立即使缓存失效
-        // 必须在索引更新前删除，避免竞态
-        if let Some((_k, old_cached)) = self.hot_cache.remove(key) {
-            self.hot_cache_bytes
-                .fetch_sub(old_cached.size, Ordering::Relaxed);
-        }
+        let key_owned = key.to_string();
+        let mut became_primary = false;
 
-        // 更新索引，标记旧数据为删除
-        if let Some((old_off, old_sz)) = self.index.insert(key.to_string(), (offset, total)) {
-            // 以旧的 offset 为键存储，避免同 key 多次覆盖时信息丢失
-            self.lazy_deleted_entries
-                .insert(old_off, (key.to_string(), old_sz));
-
-            let mut by_end = self.lazy_by_end.write();
-            by_end.insert(old_off + old_sz, (key.to_string(), (old_off, old_sz)));
-        }
-        // 更新有序索引
-        self.ordered_index.write().insert(offset, key.to_string());
-
-        // 【可选优化】立即将新数据加入缓存，提高后续读取性能
-        // 但要检查内存是否充足
-        let mem_stats = self.get_memory_stats();
-        if mem_stats.memory_usage_ratio < 0.8 {
-            // 只在内存充足时预热
-            if compressed {
-                // 如果数据被压缩了，需要解压后再缓存
-                if let Ok(decompressed) =
-                    self.decompress_data(&actual_data, self.config.compression.algorithm)
-                {
-                    self.add_to_hot_cache_sync(key, &decompressed);
+        match self.index.entry(key_owned.clone()) {
+            Entry::Vacant(entry) => {
+                if let Some((_k, old_cached)) = self.hot_cache.remove(key) {
+                    self.hot_cache_bytes
+                        .fetch_sub(old_cached.size, Ordering::Relaxed);
                 }
-            } else {
-                // 未压缩，直接缓存
-                self.add_to_hot_cache_sync(key, &actual_data);
+                entry.insert((offset, total));
+                became_primary = true;
+            }
+            Entry::Occupied(mut occupied) => {
+                if let Some((_k, old_cached)) = self.hot_cache.remove(key) {
+                    self.hot_cache_bytes
+                        .fetch_sub(old_cached.size, Ordering::Relaxed);
+                }
+                let (existing_offset, existing_total) = *occupied.get();
+                self.lazy_deleted_entries
+                    .insert(existing_offset, (key_owned.clone(), existing_total));
+                {
+                    let mut by_end = self.lazy_by_end.write();
+                    by_end.insert(
+                        existing_offset + existing_total,
+                        (key_owned.clone(), (existing_offset, existing_total)),
+                    );
+                }
+                occupied.insert((offset, total));
+                became_primary = true;
+            }
+        }
+
+        if became_primary {
+            self.ordered_index.write().insert(offset, key_owned.clone());
+
+            // 【可选优化】立即将新数据加入缓存，提高后续读取性能
+            // 但要检查内存是否充足
+            let mem_stats = self.get_memory_stats();
+            if mem_stats.memory_usage_ratio < 0.8 {
+                // 只在内存充足时预热
+                if compressed {
+                    // 如果数据被压缩了，需要解压后再缓存
+                    if let Ok(decompressed) =
+                        self.decompress_data(&actual_data, self.config.compression.algorithm)
+                    {
+                        self.add_to_hot_cache_sync(key, &decompressed);
+                    }
+                } else {
+                    // 未压缩，直接缓存
+                    self.add_to_hot_cache_sync(key, &actual_data);
+                }
             }
         }
 
@@ -1889,6 +1891,7 @@ impl HighPerfMmapStorage {
 
             mmap[start..end_header].copy_from_slice(&header_bytes);
             mmap[end_header..data_end].copy_from_slice(data);
+            std::sync::atomic::fence(Ordering::Release);
             mmap[start + HDR_OFF_COMMIT] = 1;
 
             Ok(())
@@ -2450,7 +2453,7 @@ impl HighPerfMmapStorage {
             growth_reserve_steps: self.config.growth_reserve_steps,
             compression: self.config.compression.clone(),
             growth_step: self.config.initial_file_size,
-            max_file_size:self.config.initial_file_size,
+            max_file_size:self.config.max_file_size,
             auto_purge_after_secs: self.config.auto_purge_after_secs,
             auto_purge_check_interval_secs: self.config.auto_purge_check_interval_secs,
         }
@@ -2588,7 +2591,8 @@ impl HighPerfMmapStorage {
         // 10. 重启后台任务
         self.shutdown.store(false, Ordering::Relaxed);
         if self.config.enable_prefetch {
-            let store = Arc::new(self.clone());
+            // let store = Arc::new(self.clone());
+            // let store = Arc::new(self);
             // 注意：这里需要 self 是 Arc<Self>，或者在外部调用
         }
 
@@ -3044,42 +3048,42 @@ impl HighPerfMmapStorage {
         Ok(mmap[data_off..data_end].to_vec())
     }
 
-    /// 【新增】从 mmap 读取并根据需要解压
-    fn read_and_decompress(&self, offset: u64) -> io::Result<Vec<u8>> {
-        // 先无锁加载 mmap
-        let (mmap) = match self.load_mmap_ro_with_retry(Self::MMAP_RETRY_ATTEMPTS) {
-            Some(m) => m,
-            None => {
-                self.record_error("mmap_uninitialized_read");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "MMAP not initialized",
-                ));
-            }
-        };
-
-        // 读取头部，检查压缩标志
-        let len = mmap.len();
-        let start = offset as usize;
-        let end_header = start + HEADER_SIZE;
-
-        if end_header > len {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "header out of bounds"));
-        }
-
-        let header = &mmap[start..end_header];
-        let compressed_flag = header[HDR_OFF_COMPRESSED];
-
-        // 读取原始数据
-        let raw_data = Self::read_data_from_mmap_static(&mmap, offset)?;
-
-        // 根据压缩标志决定是否解压
-        if compressed_flag == 1 {
-            self.decompress_data(&raw_data, self.config.compression.algorithm)
-        } else {
-            Ok(raw_data)
-        }
-    }
+    // 【新增】从 mmap 读取并根据需要解压
+    // fn read_and_decompress(&self, offset: u64) -> io::Result<Vec<u8>> {
+    //     // 先无锁加载 mmap
+    //     let (mmap) = match self.load_mmap_ro_with_retry(Self::MMAP_RETRY_ATTEMPTS) {
+    //         Some(m) => m,
+    //         None => {
+    //             self.record_error("mmap_uninitialized_read");
+    //             return Err(std::io::Error::new(
+    //                 std::io::ErrorKind::Other,
+    //                 "MMAP not initialized",
+    //             ));
+    //         }
+    //     };
+    //
+    //     // 读取头部，检查压缩标志
+    //     let len = mmap.len();
+    //     let start = offset as usize;
+    //     let end_header = start + HEADER_SIZE;
+    //
+    //     if end_header > len {
+    //         return Err(Error::new(ErrorKind::UnexpectedEof, "header out of bounds"));
+    //     }
+    //
+    //     let header = &mmap[start..end_header];
+    //     let compressed_flag = header[HDR_OFF_COMPRESSED];
+    //
+    //     // 读取原始数据
+    //     let raw_data = Self::read_data_from_mmap_static(&mmap, offset)?;
+    //
+    //     // 根据压缩标志决定是否解压
+    //     if compressed_flag == 1 {
+    //         self.decompress_data(&raw_data, self.config.compression.algorithm)
+    //     } else {
+    //         Ok(raw_data)
+    //     }
+    // }
 }
 
 impl Drop for HighPerfMmapStorage {

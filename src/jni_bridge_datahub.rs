@@ -1,9 +1,9 @@
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jdouble, jlong, jstring};
+use jni::sys::{jboolean, jbyteArray, jdouble, jint, jlong, jstring};
 use std::path::PathBuf;
 use std::sync::Arc;
-
+use log::LevelFilter;
 use crate::high_perf_mmap_storage::{
     HighPerfMmapConfig,
     HighPerfMmapStatus,
@@ -13,6 +13,8 @@ use crate::high_perf_mmap_storage::{
 use serde::Deserialize;
 use serde_json;
 
+// 给 Java / 其他 Rust 调用的初始化函数
+pub use crate::logging::init_logger_once;
 type ResultBox<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn create_storage_handle(
@@ -80,7 +82,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         create_storage_handle(disk_path, config, MemoryLimitConfig::default(), false)
     })();
-    
+
     match result {
         Ok(ptr) => ptr,
         Err(e) => {
@@ -109,7 +111,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         create_storage_handle(disk_path, config, memory, false)
     })();
-    
+
     match result {
         Ok(ptr) => ptr,
         Err(e) => {
@@ -148,13 +150,13 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
     #[derive(Debug, Deserialize)]
     struct IncomingConfig {
         disk_dir: String,
-        #[serde(default)] 
+        #[serde(default)]
         clear_on_start: bool,
-        #[serde(default)] 
+        #[serde(default)]
         config: Option<HighPerfMmapConfig>,
-        #[serde(default)] 
+        #[serde(default)]
         memory_limit: Option<MemoryLimitConfig>,
-        #[serde(default)] 
+        #[serde(default)]
         compression: Option<crate::high_perf_mmap_storage::CompressionConfig>,
         // #[serde(default)] clear_on_start: bool,
         // #[serde(default)] config: Option<HighPerfMmapConfig>,
@@ -217,7 +219,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         // if let Some(v) = incoming.reject_writes_under_pressure { memory.reject_writes_under_pressure = v; }
         // if let Some(v) = incoming.check_interval_ms { memory.check_interval_ms = v; }
 
-         let mut cfg = incoming.config.unwrap_or_default();
+        let mut cfg = incoming.config.unwrap_or_default();
         // 如果存在顶层的 compression 配置，覆盖 config 中的 compression
         if let Some(compression_config) = incoming.compression {
             cfg.compression = compression_config;
@@ -259,7 +261,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         storage.write(&key_str, &data_bytes)?;
         Ok(1)
     })();
-    
+
     match result {
         Ok(success) => success,
         Err(e) => {
@@ -294,7 +296,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
             None => Ok(std::ptr::null_mut()),
         }
     })();
-    
+
     match result {
         Ok(java_array) => java_array,
         Err(e) => {
@@ -353,7 +355,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
         let java_string = env.new_string(&status_json)?;
         Ok(java_string.into_raw())
     })();
-    
+
     match result {
         Ok(java_string) => java_string,
         Err(e) => {
@@ -403,7 +405,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         Ok(1)
     })();
-    
+
     match result {
         Ok(success) => success,
         Err(e) => {
@@ -470,7 +472,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         Ok(hit_rate)
     })();
-    
+
     match result {
         Ok(hit_rate) => hit_rate,
         Err(e) => {
@@ -498,7 +500,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         Ok(stats.avg_read_latency_us as jlong)
     })();
-    
+
     match result {
         Ok(latency) => latency,
         Err(e) => {
@@ -526,7 +528,7 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
 
         Ok(stats.avg_write_latency_us as jlong)
     })();
-    
+
     match result {
         Ok(latency) => latency,
         Err(e) => {
@@ -562,5 +564,42 @@ pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_D
                 .unwrap_or_default();
             0
         }
+    }
+}
+
+/// 兼容旧接口：getStats 调用 getStatus
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_com_flux_collaboration_utils_cache_rust_jni_DatahubRustJniCache_initRustLogger(
+    mut env: JNIEnv,
+    _class: JClass,
+    j_log_dir: JString,
+    j_level: jint,
+) {
+    // 1. 从 Java 字符串获取日志目录（允许传 null 表示用默认）
+    let log_dir: Option<String> = if j_log_dir.is_null() {
+        None
+    } else {
+        match env.get_string(&j_log_dir) {
+            Ok(s) => Some(s.to_string_lossy().into_owned()),
+            Err(_) => None,
+        }
+    };
+
+    // 2. 从 Java 的 int 映射到 LevelFilter，你可以自定义一个协议
+    let level = match j_level {
+        0 => LevelFilter::Error,
+        1 => LevelFilter::Warn,
+        2 => LevelFilter::Info,
+        3 => LevelFilter::Debug,
+        4 => LevelFilter::Trace,
+        _ => LevelFilter::Info,
+    };
+
+    // 3. 调用我们前面封装好的 init_logger_once
+    if let Err(e) = init_logger_once(log_dir.as_deref(), level) {
+        // 这里你可以选择：
+        // - 打印到 stderr
+        // - 或者抛 Java 异常（推荐在有需求时再做）
+        eprintln!("Failed to init native logger: {e}");
     }
 }

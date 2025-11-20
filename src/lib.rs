@@ -16,6 +16,7 @@ pub mod high_perf_mmap_storage;
 // pub mod big_data_storage;
 // pub mod optimized_cache;
 // pub mod error_handling;
+mod logging;
 
 // pub use cache::{LocalCache, LocalCacheBuilder, MetricsSnapshot};
 // pub use big_data_storage::{BigDataStorage, BigDataStorageConfig, BigDataStats};

@@ -1230,12 +1230,24 @@ impl HighPerfMmapStorage {
         };
 
         // 读取数据
-        let data = match Self::read_data_from_mmap_static(&mmap, offset) {
+        let (raw_data, was_compressed) = match Self::read_data_from_mmap_static(&mmap, offset) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(None);
             }
             Err(e) => return Err(e),
+        };
+
+        let data = if was_compressed {
+            match self.decompress_data(&raw_data, self.config.compression.algorithm) {
+                Ok(decompressed) => decompressed,
+                Err(err) => {
+                    self.record_error("decompress_failed_read");
+                    return Err(err);
+                }
+            }
+        } else {
+            raw_data
         };
 
         self.add_to_hot_cache_sync(key, &data);
@@ -2964,7 +2976,20 @@ impl HighPerfMmapStorage {
                             if let Some(mmap) =
                                 store.load_mmap_ro_with_retry(Self::MMAP_RETRY_ATTEMPTS)
                             {
-                                if let Ok(data) = Self::read_data_from_mmap_static(&mmap, entry.0) {
+                                if let Ok((raw_data, was_compressed)) =
+                                    Self::read_data_from_mmap_static(&mmap, entry.0)
+                                {
+                                    let data = if was_compressed {
+                                        match store.decompress_data(
+                                            &raw_data,
+                                            store.config.compression.algorithm,
+                                        ) {
+                                            Ok(decompressed) => decompressed,
+                                            Err(_) => continue,
+                                        }
+                                    } else {
+                                        raw_data
+                                    };
                                     let need = data.len() as u64;
                                     let used = store.hot_cache_bytes.load(Ordering::Relaxed);
                                     let limit = store.config.l1_cache_size_limit;
@@ -3005,7 +3030,7 @@ impl HighPerfMmapStorage {
     }
 
     #[inline]
-    fn read_data_from_mmap_static(mmap: &Mmap, offset: u64) -> io::Result<Vec<u8>> {
+    fn read_data_from_mmap_static(mmap: &Mmap, offset: u64) -> io::Result<(Vec<u8>, bool)> {
         use std::io::{Error, ErrorKind};
 
         let len = mmap.len();
@@ -3023,6 +3048,8 @@ impl HighPerfMmapStorage {
             header[HDR_OFF_DATA_SIZE.start + 2],
             header[HDR_OFF_DATA_SIZE.start + 3],
         ]) as usize;
+
+        let compressed_flag = header[HDR_OFF_COMPRESSED] == 1;
 
         // 等待提交位
         if header[HDR_OFF_COMMIT] != 1 {
@@ -3043,9 +3070,8 @@ impl HighPerfMmapStorage {
             return Err(Error::new(ErrorKind::UnexpectedEof, "data out of bounds"));
         }
 
-        // 【关键：直接返回原始数据，不在这里解压】
-        // 解压交给上层处理，因为这个静态方法无法访问 self
-        Ok(mmap[data_off..data_end].to_vec())
+        // 【关键：直接返回原始数据以及压缩标识】
+        Ok((mmap[data_off..data_end].to_vec(), compressed_flag))
     }
 
     // 【新增】从 mmap 读取并根据需要解压
